@@ -20,6 +20,24 @@ using namespace ImportVerilog;
 
 static constexpr StringLiteral dpiExportAttrName = "circt.dpi.export";
 
+/// Look through the `BlockStatement`s slang wraps around a labeled statement
+/// and return the enclosed concurrent assertion, if any. This lets
+/// `Foo: assert property (...)` be lowered the same way as an unlabeled
+/// `assert property (...)`, rather than being buried in a procedure.
+static const slang::ast::ConcurrentAssertionStatement *
+getConcurrentAssertion(const slang::ast::Statement &stmt) {
+  const auto *current = &stmt;
+  while (auto *block = current->as_if<slang::ast::BlockStatement>()) {
+    // Only look through blocks that exist solely to carry the label. Anything
+    // that declares its own symbols has to stay inside a procedure.
+    if (block->blockSymbol &&
+        !block->blockSymbol->members().empty())
+      return nullptr;
+    current = &block->body;
+  }
+  return current->as_if<slang::ast::ConcurrentAssertionStatement>();
+}
+
 //===----------------------------------------------------------------------===//
 // Utilities
 //===----------------------------------------------------------------------===//
@@ -866,8 +884,8 @@ struct ModuleVisitor : public BaseVisitor {
   // Handle procedures.
   LogicalResult convertProcedure(moore::ProcedureKind kind,
                                  const slang::ast::Statement &body) {
-    if (body.as_if<slang::ast::ConcurrentAssertionStatement>())
-      return context.convertStatement(body);
+    if (const auto *assertion = getConcurrentAssertion(body))
+      return context.convertStatement(*assertion);
     auto procOp = moore::ProcedureOp::create(builder, loc, kind);
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToEnd(&procOp.getBody().emplaceBlock());
