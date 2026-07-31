@@ -1295,6 +1295,35 @@ hw.module @NestedProjectionAcrossWaitBlocks(in %v : i4) {
   }
 }
 
+// A wait inside a loop does not sever a projection whose defining block is part
+// of that same loop: getting back to the use runs the definition again.
+// CHECK-LABEL: @NestedProjectionInLoopWithWait
+hw.module @NestedProjectionInLoopWithWait(in %v : i4, in %c : i1) {
+  %t = llhd.constant_time <0ns, 0d, 1e>
+  %true = hw.constant true
+  %c4 = hw.constant -4 : i3
+  %init = hw.aggregate_constant [0 : i8, 0 : i8] : !hw.array<2xi8>
+  %mem = llhd.sig %init : !hw.array<2xi8>
+  // CHECK-NOT: llhd.sig.array_get
+  // CHECK-NOT: llhd.sig.extract
+  llhd.process {
+    cf.br ^bb1
+  ^bb1:
+    %e = llhd.sig.array_get %mem[%true] : <!hw.array<2xi8>>
+    cf.br ^bb2
+  ^bb2:
+    // CHECK: hw.array_get
+    // CHECK: comb.extract
+    // CHECK: hw.array_inject
+    %sub = llhd.sig.extract %e from %c4 : <i8> -> <i4>
+    llhd.drv %sub, %v after %t : i4
+    cf.cond_br %c, ^bb3, ^bb1
+  ^bb3:
+    // CHECK: llhd.drv %mem
+    llhd.wait ^bb1
+  }
+}
+
 
 // Nested projections in normal CFG is allowed.
 // CHECK-LABEL: @NestedProjectionAcrossCfgBlocks

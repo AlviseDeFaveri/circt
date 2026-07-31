@@ -727,29 +727,41 @@ static Value getRootSignal(Value value) {
   return value;
 }
 
-// Check that there is not `wait` block between the def and the use of a
-// projection.
-static bool crossesWait(Block *defBlock, Block *useBlock, Region &region,
-                        DominanceInfo &dominance) {
+/// Check whether any path from the definition of a projection to a use of it
+/// passes through an `llhd.wait`. Such a projection cannot be promoted, since
+/// the chain connecting it to its slot gets severed when Mem2Reg rewrites
+/// signal references into SSA block arguments.
+static bool crossesWait(Block *defBlock, Block *useBlock) {
   if (defBlock == useBlock)
     return false;
-  for (auto &block : region) {
-    auto waitOp = dyn_cast<WaitOp>(block.getTerminator());
-    if (!waitOp)
-      continue;
-    if (!dominance.properlyDominates(defBlock, &block))
-      continue;
-    // Forward reachability from this wait's block to useBlock.
-    SmallVector<Block *> worklist{&block};
-    SmallPtrSet<Block *, 8> visited{&block};
-    while (!worklist.empty()) {
-      Block *b = worklist.pop_back_val();
-      if (b == useBlock)
-        return true;
-      for (Block *succ : b->getSuccessors())
-        if (visited.insert(succ).second)
-          worklist.push_back(succ);
-    }
+
+  // Walk forward from the definition, tracking for each block whether a wait
+  // has been passed on the way there. Since a block can be reachable both with
+  // and without a wait in between, track the two flavors separately.
+  //
+  // Paths that lead through `defBlock` again are not interesting: they
+  // re-execute the projection, so the use observes that new definition rather
+  // than one from before the wait.
+  SmallPtrSet<Block *, 8> beforeWait, afterWait;
+  SmallVector<std::pair<Block *, bool>> worklist;
+  auto push = [&](Block *block, bool crossed) {
+    if (block == defBlock)
+      return;
+    if ((crossed ? afterWait : beforeWait).insert(block).second)
+      worklist.push_back({block, crossed});
+  };
+
+  // A wait terminating `defBlock` itself is crossed by every path leaving it.
+  for (auto *successor : defBlock->getSuccessors())
+    push(successor, isa<WaitOp>(defBlock->getTerminator()));
+
+  while (!worklist.empty()) {
+    auto [block, crossed] = worklist.pop_back_val();
+    if (crossed && block == useBlock)
+      return true;
+    crossed |= isa<WaitOp>(block->getTerminator());
+    for (auto *successor : block->getSuccessors())
+      push(successor, crossed);
   }
   return false;
 }
@@ -948,8 +960,6 @@ void Promoter::promoteSlot() {
 
 /// Identify any promotable slots probed or driven under the current region.
 void Promoter::findPromotableSlots() {
-  DominanceInfo dominance(region.getParentOp());
-
   SmallPtrSet<Value, 8> seenSlots;
   SmallPtrSet<Operation *, 8> checkedUsers;
   SmallVector<Operation *, 8> userWorklist;
@@ -1006,8 +1016,7 @@ void Promoter::findPromotableSlots() {
                 isa<SigArrayGetOp, SigExtractOp, SigStructExtractOp>(
                     projectionUser) &&
                 projectionUser->getBlock() != user->getBlock() &&
-                crossesWait(user->getBlock(), projectionUser->getBlock(),
-                            region, dominance))
+                crossesWait(user->getBlock(), projectionUser->getBlock()))
               return false;
             LLVM_DEBUG(llvm::dbgs()
                        << "[ALVISE] User of user " << *projectionUser << "\n");
