@@ -543,6 +543,12 @@ void circt::populateLlhdToCorePipeline(
   }
   modulePM.addPass(llhd::createMem2RegPass());
   modulePM.addPass(llhd::createHoistSignalsPass());
+  // Unroll loops inside processes before `Deseq` runs. A loop-carried value is
+  // opaque to `Deseq`'s value analysis, so an `always_ff` containing a `for`
+  // loop would otherwise be rejected with "unknown reset scheme".
+  modulePM.addPass(llhd::createUnrollLoopsPass());
+  modulePM.addPass(mlir::createCSEPass());
+  modulePM.addPass(mlir::createCanonicalizerPass());
   modulePM.addPass(llhd::createDeseqPass());
   modulePM.addPass(llhd::createLowerProcessesPass());
   // `Deseq` and `LowerProcesses` create `llhd.combinational` ops that the run of

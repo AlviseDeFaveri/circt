@@ -415,25 +415,33 @@ namespace {
 struct UnrollLoopsPass
     : public llhd::impl::UnrollLoopsPassBase<UnrollLoopsPass> {
   void runOnOperation() override;
-  void runOnOperation(CombinationalOp op);
+  void runOnRegion(Operation *op, Region &body);
 };
 } // namespace
 
 void UnrollLoopsPass::runOnOperation() {
-  for (auto op : getOperation().getOps<CombinationalOp>())
-    runOnOperation(op);
+  // Unroll loops in both `llhd.combinational` and `llhd.process` bodies. The
+  // latter matters because `Deseq` cannot reason about a loop-carried value, so
+  // an `always_ff` containing a `for` loop only turns into a register once the
+  // loop has been unrolled.
+  for (auto &op : llvm::make_early_inc_range(getOperation().getOps())) {
+    if (auto combOp = dyn_cast<CombinationalOp>(op))
+      runOnRegion(combOp, combOp.getBody());
+    else if (auto processOp = dyn_cast<ProcessOp>(op))
+      runOnRegion(processOp, processOp.getBody());
+  }
 }
 
-void UnrollLoopsPass::runOnOperation(CombinationalOp op) {
+void UnrollLoopsPass::runOnRegion(Operation *op, Region &body) {
   // There's nothing to do if we only have a single block. MLIR even refuses to
   // compute a dominator tree in that case.
-  if (op.getBody().hasOneBlock())
+  if (body.hasOneBlock())
     return;
 
   // Find the loops.
-  LLVM_DEBUG(llvm::dbgs() << "Unrolling loops in " << op.getLoc() << "\n");
+  LLVM_DEBUG(llvm::dbgs() << "Unrolling loops in " << op->getLoc() << "\n");
   DominanceInfo domInfo(op);
-  CFGLoopInfo cfgLoopInfo(domInfo.getDomTree(&op.getBody()));
+  CFGLoopInfo cfgLoopInfo(domInfo.getDomTree(&body));
 
   // We only support simple loops where there is a single back-edge to the
   // header, and the latch block has a back-edge to a single header. Create a
@@ -446,6 +454,14 @@ void UnrollLoopsPass::runOnOperation(CombinationalOp op) {
     auto *header = cfgLoop->getHeader();
     auto *latch = cfgLoop->getLoopLatch();
     if (!latch)
+      continue;
+
+    // Skip the implicit loop a process forms around its `llhd.wait`. It is a
+    // suspension point rather than a data loop, has no static trip count, and
+    // replicating it would be meaningless.
+    if (llvm::any_of(cfgLoop->getBlocks(), [](Block *block) {
+          return isa<WaitOp>(block->getTerminator());
+        }))
       continue;
 
     LLVM_DEBUG({

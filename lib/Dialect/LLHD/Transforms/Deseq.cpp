@@ -360,10 +360,16 @@ void Deseq::deseq() {
 /// the wait and drive ops that are relevant.
 bool Deseq::analyzeProcess() {
   // We can only desequentialize processes with no side-effecting ops besides
-  // the `WaitOp` or `HaltOp` terminators.
+  // the `WaitOp` or `HaltOp` terminators. `ProbeOp`s are also fine: since a
+  // desequentializable process has exactly one wait, every probe in its body
+  // samples its signal at the same point in time, namely the trigger event that
+  // resumed the process. That is exactly the sampling behavior of the register
+  // we are about to create, so the probes can be pulled out of the process and
+  // fed into the register's data input. `HoistSignals` performs that hoisting on
+  // the `llhd.combinational` op we specialize the process into.
   for (auto &block : process.getBody()) {
     for (auto &op : block) {
-      if (isa<WaitOp, HaltOp>(op))
+      if (isa<WaitOp, HaltOp, ProbeOp>(op))
         continue;
       if (!isMemoryEffectFree(&op)) {
         LLVM_DEBUG({
