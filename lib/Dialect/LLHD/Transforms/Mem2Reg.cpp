@@ -715,6 +715,18 @@ static Value packProjections(OpBuilder &builder, Value value,
   return value;
 }
 
+/// Resolve a signal value to the root signal it (transitively) projects into,
+/// regardless of which region the projection ops themselves live in. Returns
+/// the value itself if it is not a projection.
+static Value getRootSignal(Value value) {
+  while (auto *op = value.getDefiningOp()) {
+    if (!isa<SigArrayGetOp, SigExtractOp, SigStructExtractOp>(op))
+      break;
+    value = op->getOperand(0);
+  }
+  return value;
+}
+
 // Check that there is not `wait` block between the def and the use of a
 // projection.
 static bool crossesWait(Block *defBlock, Block *useBlock, Region &region,
@@ -771,6 +783,7 @@ struct Promoter {
   void insertProbeBlocks();
   void insertProbes();
   void insertProbes(BlockEntry *node);
+  void widenObservedSets();
 
   void insertDriveBlocks();
   void insertDrives();
@@ -806,6 +819,10 @@ struct Promoter {
   /// A set of all promotable signal SSA values. This is the union of `slots`
   /// and `projections` of those slots.
   SmallDenseSet<Value> promotable;
+  /// The slots for which promotion inserted a probe of the entire slot. Reading
+  /// the whole slot where the original code only read a projection of it widens
+  /// what the region samples, which `widenObservedSets` compensates for.
+  SmallDenseSet<Value> widenedSlots;
 
   /// The slot currently being analyzed and rewritten. The lattice and all
   /// per-slot methods operate relative to this value.
@@ -857,6 +874,10 @@ LogicalResult Promoter::promote() {
     promoteSlot();
   }
   currentSlot = {};
+
+  // Keep the sensitivity of the region in sync with the reads that promotion
+  // introduced.
+  widenObservedSets();
 
   // Erase operations that have become unused.
   pruner.eraseNow();
@@ -936,6 +957,19 @@ void Promoter::findPromotableSlots() {
   region.walk([&](Operation *op) {
     LLVM_DEBUG(llvm::dbgs() << "[ALVISE] Checking Operation " << *op << "\n");
     for (auto operand : op->getOperands()) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "[ALVISE] Checking Operand " << operand << "\n");
+
+      // Resolve `operand` to the root signal it (transitively) projects
+      // into, regardless of which region the projection ops themselves live
+      // in. This allows a slot to be discovered even if the projection
+      // chain connecting to it was built outside `region` -- e.g. a
+      // `llhd.sig.array_get` shared between a module-scope continuous
+      // assign and a nested process that projects a different, disjoint
+      // field out of the same element. Deduplicate on the resolved root, such
+      // that multiple projections into the same signal produce a single slot.
+      operand = getRootSignal(operand);
+
       if (!seenSlots.insert(operand).second)
         continue;
 
@@ -953,33 +987,48 @@ void Promoter::findPromotableSlots() {
         // We don't support nested probes and drives.
         if (region.isProperAncestor(user->getParentRegion()))
           return false;
-        // Ignore uses outside of the region.
-        if (user->getParentRegion() != &region)
-          return true;
-        // Projection operations are okay, as long as nested projections
-        // stay in the same block. Cross-block nested projections would break
-        // during promotion because the projection chain gets severed when
-        // Mem2Reg rewrites signal references into SSA block arguments.
-        if (isa<SigArrayGetOp, SigExtractOp, SigStructExtractOp>(user)) {
+
+        auto isProjection =
+            isa<SigArrayGetOp, SigExtractOp, SigStructExtractOp>(user);
+        auto inRegion = user->getParentRegion() == &region;
+
+        // Projection operations are okay wherever they are defined. Ones
+        // outside the region are never rewritten by the promotion, so the
+        // chain from the root slot to them stays intact and we can descend
+        // into their users to reach the probes and drives inside the region.
+        // Ones inside the region must keep nested projections in the same
+        // block, since the chain gets severed when Mem2Reg rewrites signal
+        // references into SSA block arguments.
+        if (isProjection) {
           hasProjection = true;
           for (auto *projectionUser : user->getUsers()) {
-            if (isa<SigArrayGetOp, SigExtractOp, SigStructExtractOp>(
+            if (inRegion &&
+                isa<SigArrayGetOp, SigExtractOp, SigStructExtractOp>(
                     projectionUser) &&
                 projectionUser->getBlock() != user->getBlock() &&
                 crossesWait(user->getBlock(), projectionUser->getBlock(),
                             region, dominance))
               return false;
             LLVM_DEBUG(llvm::dbgs()
-                       << "[ALVISE] User of user " << projectionUser);
+                       << "[ALVISE] User of user " << *projectionUser << "\n");
 
-            hasBlockingDrive |= isBlockingDrive(projectionUser);
-            hasDeltaDrive |= isDeltaDrive(projectionUser);
+            // Only drives inside the region participate in the promotion, so
+            // only those constrain the blocking/delta mix checked below.
+            if (projectionUser->getParentRegion() == &region) {
+              hasBlockingDrive |= isBlockingDrive(projectionUser);
+              hasDeltaDrive |= isDeltaDrive(projectionUser);
+            }
             if (checkedUsers.insert(projectionUser).second)
               userWorklist.push_back(projectionUser);
           }
           projections.insert({user->getResult(0), operand});
           return true;
         }
+
+        // Ignore non-projection uses outside of the region.
+        if (!inRegion)
+          return true;
+
         hasBlockingDrive |= isBlockingDrive(user);
         hasDeltaDrive |= isDeltaDrive(user);
         return isa<ProbeOp>(user) || isBlockingDrive(user) ||
@@ -1654,6 +1703,77 @@ void Promoter::insertProbes(BlockEntry *node) {
   auto value = ProbeOp::create(builder, currentSlot.getLoc(), currentSlot);
   auto *def = lattice->createDef(value, DriveCondition::never());
   node->insertedProbe = def;
+  widenedSlots.insert(currentSlot);
+}
+
+/// Promotion reads the entire slot through the probes inserted by
+/// `insertProbes`, even where the original code only read a projection of it. A
+/// process whose sensitivity was derived from those projections would then
+/// sample parts of the slot it never wakes up for, so add a probe of the whole
+/// slot to the observed set of every `llhd.wait` that observes a projection of
+/// it.
+///
+/// Waits that don't observe the slot at all are left alone. Their sensitivity
+/// comes from somewhere else -- a clock, typically -- and widening it would
+/// destroy the edge sensitivity that `DeseqPass` looks for.
+void Promoter::widenObservedSets() {
+  if (widenedSlots.empty())
+    return;
+
+  auto *parentOp = region.getParentOp();
+  DominanceInfo dominance(parentOp);
+  SmallDenseMap<Value, Value> outerProbes;
+
+  // Find a probe of `slot` outside the region that is available at `parentOp`,
+  // or create one just before it.
+  auto getOuterProbe = [&](Value slot) {
+    auto &outerProbe = outerProbes[slot];
+    if (outerProbe)
+      return outerProbe;
+    for (auto *user : slot.getUsers()) {
+      auto probeOp = dyn_cast<ProbeOp>(user);
+      if (!probeOp || !probeOp->getParentRegion()->isProperAncestor(&region))
+        continue;
+      if (!dominance.properlyDominates(probeOp.getOperation(), parentOp))
+        continue;
+      outerProbe = probeOp.getResult();
+      return outerProbe;
+    }
+    OpBuilder builder(parentOp);
+    outerProbe = ProbeOp::create(builder, slot.getLoc(), slot);
+    return outerProbe;
+  };
+
+  for (auto &block : region) {
+    auto waitOp = dyn_cast<WaitOp>(block.getTerminator());
+    if (!waitOp)
+      continue;
+
+    for (auto slot : slots) {
+      if (!widenedSlots.contains(slot))
+        continue;
+
+      // Check whether this wait observes a projection of the slot, but not the
+      // slot itself.
+      auto observesProjection = false;
+      auto observesSlot = false;
+      for (auto observed : waitOp.getObserved()) {
+        auto probeOp = observed.getDefiningOp<ProbeOp>();
+        if (!probeOp)
+          continue;
+        if (probeOp.getSignal() == slot)
+          observesSlot = true;
+        else if (getRootSignal(probeOp.getSignal()) == slot)
+          observesProjection = true;
+      }
+      if (observesSlot || !observesProjection)
+        continue;
+
+      LLVM_DEBUG(llvm::dbgs() << "- Widening observed set of " << waitOp
+                              << " to " << slot << "\n");
+      waitOp.getObservedMutable().append(getOuterProbe(slot));
+    }
+  }
 }
 
 /// Insert additional drive blocks where needed. This can happen if a definition
