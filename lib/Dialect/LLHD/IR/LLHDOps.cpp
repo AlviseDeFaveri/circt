@@ -628,8 +628,158 @@ LogicalResult llhd::DriveOp::fold(FoldAdaptor adaptor,
   return failure();
 }
 
+namespace {
+/// A single step of a projection into the signal being driven. Mirrors the
+/// `llhd.sig.array_get` and `llhd.sig.extract` ops that would be needed to
+/// address the sub-element the step describes.
+struct NarrowStep {
+  /// Index operand for an array step, or null for a bit range step.
+  Value index;
+  /// Low bit for a bit range step.
+  unsigned lowBit;
+  /// Type of the addressed sub-element.
+  Type type;
+
+  bool isArrayGet() const { return bool(index); }
+};
+} // namespace
+
+/// Check that `value` reads exactly the sub-element of `signal` addressed by
+/// `steps`, i.e. that it is a chain of `hw.array_get`/`comb.extract` ops
+/// mirroring `steps` down to an `llhd.prb` of `signal`.
+static bool readsSameSlice(Value value, Value signal,
+                           ArrayRef<NarrowStep> steps) {
+  for (const auto &step : llvm::reverse(steps)) {
+    if (step.isArrayGet()) {
+      auto getOp = value.getDefiningOp<hw::ArrayGetOp>();
+      if (!getOp || getOp.getIndex() != step.index)
+        return false;
+      value = getOp.getInput();
+      continue;
+    }
+    auto extractOp = value.getDefiningOp<comb::ExtractOp>();
+    if (!extractOp || extractOp.getLowBit() != step.lowBit ||
+        extractOp.getType() != step.type)
+      return false;
+    value = extractOp.getInput();
+  }
+  auto probeOp = value.getDefiningOp<llhd::ProbeOp>();
+  return probeOp && probeOp.getSignal() == signal;
+}
+
+/// Narrow a drive whose value is a read-modify-write of the signal it drives.
+/// Promoting a partially-assigned process produces drives of an entire signal
+/// where all but a few bits are read straight back from a probe of that same
+/// signal. Those drives overlap any other driver of the untouched bits, which
+/// blocks passes that reason about disjoint drivers. Rewrite them to drive only
+/// the sub-element that actually changes:
+///
+/// ```
+/// %p = llhd.prb %sig : !hw.array<4xi8>
+/// %e = hw.array_get %p[%i]
+/// %v = comb.concat (comb.extract %e from 3), %x, (comb.extract %e from 0)
+/// llhd.drv %sig, (hw.array_inject %p[%i], %v)
+/// ```
+///
+/// becomes a drive of `llhd.sig.extract (llhd.sig.array_get %sig[%i]) from 1`.
+static LogicalResult narrowDrive(llhd::DriveOp op, PatternRewriter &rewriter) {
+  // Only narrow where probes read the signal continuously. Inside a process a
+  // probe may have been taken before a `llhd.wait`, in which case writing the
+  // probed value back is not a no-op and the identity slices are meaningful.
+  if (mayHaveSSADominance(*op->getParentRegion()))
+    return failure();
+
+  auto signal = op.getSignal();
+  auto value = op.getValue();
+  SmallVector<NarrowStep> steps;
+
+  // Peel off read-modify-write layers for as long as we can.
+  while (true) {
+    // `hw.array_inject` of the probed array only changes one element.
+    if (auto injectOp = value.getDefiningOp<hw::ArrayInjectOp>()) {
+      if (!readsSameSlice(injectOp.getInput(), signal, steps))
+        break;
+      steps.push_back({injectOp.getIndex(), 0, injectOp.getElement().getType()});
+      value = injectOp.getElement();
+      continue;
+    }
+
+    // A `comb.concat` whose outer operands read the probed value back only
+    // changes the span between the first and last operand that does not.
+    auto concatOp = value.getDefiningOp<comb::ConcatOp>();
+    if (!concatOp)
+      break;
+
+    // Walk the operands from the least to the most significant one, tracking
+    // the bit offset of each, and find the span of changed bits.
+    auto operands = llvm::to_vector(llvm::reverse(concatOp.getOperands()));
+    SmallVector<unsigned> offsets;
+    unsigned offset = 0;
+    for (auto operand : operands) {
+      offsets.push_back(offset);
+      offset += cast<IntegerType>(operand.getType()).getWidth();
+    }
+    auto isWriteBack = [&](unsigned idx) {
+      SmallVector<NarrowStep> sliceSteps(steps);
+      sliceSteps.push_back(
+          {Value{}, offsets[idx], operands[idx].getType()});
+      return readsSameSlice(operands[idx], signal, sliceSteps);
+    };
+    unsigned lo = 0, hi = operands.size();
+    while (lo < hi && isWriteBack(lo))
+      ++lo;
+    while (hi > lo && isWriteBack(hi - 1))
+      --hi;
+
+    // Bail out if nothing is written back, or if the drive turns out to be a
+    // complete no-op. Erasing the latter would remove a driver entirely, which
+    // is not ours to decide here.
+    if ((lo == 0 && hi == operands.size()) || lo == hi)
+      break;
+
+    auto changed = ArrayRef(operands).slice(lo, hi - lo);
+    auto width = offsets[hi - 1] +
+                 cast<IntegerType>(operands[hi - 1].getType()).getWidth() -
+                 offsets[lo];
+    steps.push_back({Value{}, offsets[lo],
+                     rewriter.getIntegerType(width)});
+    value = changed.size() == 1
+                ? changed.front()
+                : comb::ConcatOp::create(
+                      rewriter, op.getLoc(),
+                      llvm::to_vector(llvm::reverse(changed)))
+                      .getResult();
+  }
+
+  if (steps.empty())
+    return failure();
+
+  // Materialize the projection into the signal and drive only that part.
+  for (const auto &step : steps) {
+    if (step.isArrayGet()) {
+      signal = llhd::SigArrayGetOp::create(rewriter, op.getLoc(), signal,
+                                           step.index);
+      continue;
+    }
+    auto lowBit = hw::ConstantOp::create(
+        rewriter, op.getLoc(),
+        rewriter.getIntegerType(llvm::Log2_64_Ceil(
+            cast<RefType>(signal.getType()).getNestedType().getIntOrFloatBitWidth())),
+        step.lowBit);
+    signal = llhd::SigExtractOp::create(rewriter, op.getLoc(),
+                                        RefType::get(step.type), signal, lowBit);
+  }
+
+  rewriter.replaceOpWithNewOp<llhd::DriveOp>(op, signal, value, op.getTime(),
+                                             op.getEnable());
+  return success();
+}
+
 LogicalResult llhd::DriveOp::canonicalize(llhd::DriveOp op,
                                           PatternRewriter &rewriter) {
+  if (succeeded(narrowDrive(op, rewriter)))
+    return success();
+
   if (!op.getEnable())
     return failure();
 

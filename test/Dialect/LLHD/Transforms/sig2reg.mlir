@@ -180,3 +180,45 @@ hw.module @RemoveDriveOnlySignals(in %d: i42, in %e: i1) {
   llhd.drv %b, %d after %1 if %e : i42
   // CHECK: hw.output
 }
+
+// Elements of an array signal are addressed at `index * elementBitWidth`.
+// CHECK-LABEL: @ArrayGetProjection
+hw.module @ArrayGetProjection(in %in0: i8, in %in1: i8, out o: !hw.array<4xi8>) {
+  // CHECK-NOT: llhd.sig
+  // CHECK-NOT: llhd.drv
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  %c0_i2 = hw.constant 0 : i2
+  %c2_i2 = hw.constant 2 : i2
+  %init = hw.aggregate_constant [0 : i8, 0 : i8, 0 : i8, 0 : i8] : !hw.array<4xi8>
+  %sig = llhd.sig %init : !hw.array<4xi8>
+  %e0 = llhd.sig.array_get %sig[%c0_i2] : <!hw.array<4xi8>>
+  %e2 = llhd.sig.array_get %sig[%c2_i2] : <!hw.array<4xi8>>
+  llhd.drv %e0, %in0 after %0 : i8
+  llhd.drv %e2, %in1 after %0 : i8
+  %prb = llhd.prb %sig : !hw.array<4xi8>
+  // Element 0 occupies bits 7:0, so it is injected without a shift. Element 2
+  // occupies bits 23:16 and is shifted up by 16.
+  // CHECK-DAG: [[C16:%.+]] = hw.constant 16 : i32
+  // CHECK-DAG: [[E0:%.+]] = comb.concat {{%.+}}, %in0 : i24, i8
+  // CHECK-DAG: [[E2:%.+]] = comb.concat {{%.+}}, %in1 : i24, i8
+  // CHECK: [[SHL:%.+]] = comb.shl [[E2]], [[C16]]
+  // CHECK: [[OR:%.+]] = comb.or [[SHL]], {{%.+}}
+  // CHECK: [[A:%.+]] = hw.bitcast [[OR]] : (i32) -> !hw.array<4xi8>
+  // CHECK: hw.output [[A]]
+  hw.output %prb : !hw.array<4xi8>
+}
+
+// A dynamic array index cannot be scaled by the element width, so the signal
+// stays put.
+// CHECK-LABEL: @ArrayGetDynamicIndex
+hw.module @ArrayGetDynamicIndex(in %idx: i2, in %in0: i8, out o: !hw.array<4xi8>) {
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  %init = hw.aggregate_constant [0 : i8, 0 : i8, 0 : i8, 0 : i8] : !hw.array<4xi8>
+  // CHECK: llhd.sig
+  %sig = llhd.sig %init : !hw.array<4xi8>
+  %e = llhd.sig.array_get %sig[%idx] : <!hw.array<4xi8>>
+  // CHECK: llhd.drv
+  llhd.drv %e, %in0 after %0 : i8
+  %prb = llhd.prb %sig : !hw.array<4xi8>
+  hw.output %prb : !hw.array<4xi8>
+}

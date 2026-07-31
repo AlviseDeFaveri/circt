@@ -149,6 +149,33 @@ public:
 
                 return success();
               })
+              .Case<llhd::SigArrayGetOp>([&](llhd::SigArrayGetOp getOp) {
+                // Element `i` of an array occupies the bits at offset
+                // `i * elementBitWidth`. Only constant indices are supported;
+                // a dynamic one would have to be scaled by the element width,
+                // which `Offset` cannot express.
+                auto constOp =
+                    getOp.getIndex().getDefiningOp<hw::ConstantOp>();
+                if (!constOp || !offset.isStatic()) {
+                  LLVM_DEBUG(llvm::dbgs() << "  - Dynamic array index, "
+                                             "skipping...\n\n");
+                  return failure();
+                }
+
+                auto arrayType = cast<hw::ArrayType>(
+                    cast<llhd::RefType>(getOp.getInput().getType())
+                        .getNestedType());
+                auto elementBw = hw::getBitWidth(arrayType.getElementType());
+                if (elementBw <= 0)
+                  return failure();
+
+                auto index = constOp.getValue().getZExtValue();
+                for (auto *user : getOp->getUsers())
+                  stack.emplace_back(user,
+                                     Offset(index * elementBw + offset.min));
+
+                return success();
+              })
               .Default([](auto *op) {
                 LLVM_DEBUG(llvm::dbgs() << "  - User that is not a probe or "
                                            "drive, skipping...\n    "
