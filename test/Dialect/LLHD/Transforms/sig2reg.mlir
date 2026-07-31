@@ -222,3 +222,165 @@ hw.module @ArrayGetDynamicIndex(in %idx: i2, in %in0: i8, out o: !hw.array<4xi8>
   %prb = llhd.prb %sig : !hw.array<4xi8>
   hw.output %prb : !hw.array<4xi8>
 }
+
+// The first field of a struct occupies the most significant bits, so "a" sits
+// at offset 5 and "b" at offset 0.
+// CHECK-LABEL: @StructExtractProjection
+hw.module @StructExtractProjection(in %av: i3, in %bv: i5, out o: !hw.struct<a: i3, b: i5>) {
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  %init = hw.aggregate_constant [0 : i3, 0 : i5] : !hw.struct<a: i3, b: i5>
+  // CHECK-NOT: llhd.sig
+  %sig = llhd.sig %init : !hw.struct<a: i3, b: i5>
+  %fa = llhd.sig.struct_extract %sig["a"] : <!hw.struct<a: i3, b: i5>>
+  %fb = llhd.sig.struct_extract %sig["b"] : <!hw.struct<a: i3, b: i5>>
+  // CHECK-NOT: llhd.drv
+  llhd.drv %fa, %av after %0 : i3
+  llhd.drv %fb, %bv after %0 : i5
+  %prb = llhd.prb %sig : !hw.struct<a: i3, b: i5>
+  // CHECK-DAG: [[C5:%.+]] = hw.constant 5 : i8
+  // CHECK-DAG: [[BPAD:%.+]] = comb.concat {{%.+}}, %bv : i3, i5
+  // CHECK: [[APAD:%.+]] = comb.concat {{%.+}}, %av : i5, i3
+  // CHECK: [[SHL:%.+]] = comb.shl [[APAD]], [[C5]]
+  // CHECK: [[OR:%.+]] = comb.or [[SHL]], {{%.+}}
+  // CHECK: [[S:%.+]] = hw.bitcast [[OR]] : (i8) -> !hw.struct<a: i3, b: i5>
+  // CHECK: hw.output [[S]]
+  hw.output %prb : !hw.struct<a: i3, b: i5>
+}
+
+// A struct nested in an array element combines both offsets: element 1 starts
+// at bit 6, and "lo" is the last field, so it sits at offset 6.
+// CHECK-LABEL: @StructExtractInArray
+hw.module @StructExtractInArray(in %v: i2, out o: !hw.array<2xstruct<hi: i4, lo: i2>>) {
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  %e = hw.aggregate_constant [0 : i4, 0 : i2] : !hw.struct<hi: i4, lo: i2>
+  %init = hw.aggregate_constant [[0 : i4, 0 : i2], [0 : i4, 0 : i2]] : !hw.array<2xstruct<hi: i4, lo: i2>>
+  %c1 = hw.constant 1 : i1
+  // CHECK-NOT: llhd.sig
+  %sig = llhd.sig %init : !hw.array<2xstruct<hi: i4, lo: i2>>
+  %elt = llhd.sig.array_get %sig[%c1] : <!hw.array<2xstruct<hi: i4, lo: i2>>>
+  %fld = llhd.sig.struct_extract %elt["lo"] : <!hw.struct<hi: i4, lo: i2>>
+  // CHECK-NOT: llhd.drv
+  llhd.drv %fld, %v after %0 : i2
+  %prb = llhd.prb %sig : !hw.array<2xstruct<hi: i4, lo: i2>>
+  // CHECK: [[C6:%.+]] = hw.constant 6 : i12
+  // CHECK: [[PAD:%.+]] = comb.concat {{%.+}}, %v : i10, i2
+  // CHECK: [[SHL:%.+]] = comb.shl [[PAD]], [[C6]]
+  // CHECK: hw.output
+  hw.output %prb : !hw.array<2xstruct<hi: i4, lo: i2>>
+}
+
+// A union's members all share one storage location, which the offset model
+// cannot express, so the signal stays put.
+// CHECK-LABEL: @UnionExtractUnsupported
+hw.module @UnionExtractUnsupported(in %v: i3, out o: i8) {
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  %init = hw.constant 0 : i8
+  %bc = hw.bitcast %init : (i8) -> !hw.union<a: i3, b: i8>
+  // CHECK: llhd.sig
+  %sig = llhd.sig %bc : !hw.union<a: i3, b: i8>
+  %fa = llhd.sig.struct_extract %sig["a"] : <!hw.union<a: i3, b: i8>>
+  // CHECK: llhd.drv
+  llhd.drv %fa, %v after %0 : i3
+  %prb = llhd.prb %sig : !hw.union<a: i3, b: i8>
+  %out = hw.bitcast %prb : (!hw.union<a: i3, b: i8>) -> i8
+  hw.output %out : i8
+}
+
+// A drive that read-modify-writes the whole struct to update one field is
+// narrowed to that field, so it no longer overlaps the sibling drive on "b".
+// CHECK-LABEL: @NarrowRmwDrive
+hw.module @NarrowRmwDrive(in %av: i2, in %bv: i2, out o: !hw.struct<a: i2, b: i2>) {
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  %init = hw.aggregate_constant [0 : i2, 0 : i2] : !hw.struct<a: i2, b: i2>
+  // CHECK-NOT: llhd.sig
+  // CHECK-NOT: llhd.drv
+  %sig = llhd.sig %init : !hw.struct<a: i2, b: i2>
+  %fb = llhd.sig.struct_extract %sig["b"] : <!hw.struct<a: i2, b: i2>>
+  llhd.drv %fb, %bv after %0 : i2
+  %p = llhd.prb %sig : !hw.struct<a: i2, b: i2>
+  %inj = hw.struct_inject %p["a"], %av : !hw.struct<a: i2, b: i2>
+  llhd.drv %sig, %inj after %0 : !hw.struct<a: i2, b: i2>
+  %prb = llhd.prb %sig : !hw.struct<a: i2, b: i2>
+  // CHECK: hw.output
+  hw.output %prb : !hw.struct<a: i2, b: i2>
+}
+
+// The probe and the drive target need not be spelled the same way: here the
+// probe is taken of the whole array and narrowed with a value-level array_get,
+// while the drive targets a signal-level projection of the same element.
+// CHECK-LABEL: @NarrowRmwDriveThroughArray
+hw.module @NarrowRmwDriveThroughArray(in %av: i2, in %bv: i2, out o: !hw.array<2xstruct<a: i2, b: i2>>) {
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  %init = hw.aggregate_constant [[0 : i2, 0 : i2], [0 : i2, 0 : i2]] : !hw.array<2xstruct<a: i2, b: i2>>
+  %c1 = hw.constant 1 : i1
+  // CHECK-NOT: llhd.sig
+  // CHECK-NOT: llhd.drv
+  %sig = llhd.sig %init : !hw.array<2xstruct<a: i2, b: i2>>
+  %elt = llhd.sig.array_get %sig[%c1] : <!hw.array<2xstruct<a: i2, b: i2>>>
+  %fb = llhd.sig.struct_extract %elt["b"] : <!hw.struct<a: i2, b: i2>>
+  llhd.drv %fb, %bv after %0 : i2
+  %wide = llhd.prb %sig : !hw.array<2xstruct<a: i2, b: i2>>
+  %eltval = hw.array_get %wide[%c1] : !hw.array<2xstruct<a: i2, b: i2>>, i1
+  %inj = hw.struct_inject %eltval["a"], %av : !hw.struct<a: i2, b: i2>
+  llhd.drv %elt, %inj after %0 : !hw.struct<a: i2, b: i2>
+  %prb = llhd.prb %sig : !hw.array<2xstruct<a: i2, b: i2>>
+  // CHECK: hw.output
+  hw.output %prb : !hw.array<2xstruct<a: i2, b: i2>>
+}
+
+// A conditional drive really does hold the untouched fields at their old value
+// on the cycles it is disabled, so it must not be narrowed. The overlap with
+// the drive on "b" then keeps the signal from being promoted.
+// CHECK-LABEL: @NoNarrowConditionalRmwDrive
+hw.module @NoNarrowConditionalRmwDrive(in %av: i2, in %bv: i2, in %en: i1, out o: !hw.struct<a: i2, b: i2>) {
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  %init = hw.aggregate_constant [0 : i2, 0 : i2] : !hw.struct<a: i2, b: i2>
+  // CHECK: llhd.sig
+  %sig = llhd.sig %init : !hw.struct<a: i2, b: i2>
+  %fb = llhd.sig.struct_extract %sig["b"] : <!hw.struct<a: i2, b: i2>>
+  llhd.drv %fb, %bv after %0 : i2
+  %p = llhd.prb %sig : !hw.struct<a: i2, b: i2>
+  %inj = hw.struct_inject %p["a"], %av : !hw.struct<a: i2, b: i2>
+  // CHECK: llhd.drv {{.*}} if
+  llhd.drv %sig, %inj after %0 if %en : !hw.struct<a: i2, b: i2>
+  %prb = llhd.prb %sig : !hw.struct<a: i2, b: i2>
+  hw.output %prb : !hw.struct<a: i2, b: i2>
+}
+
+// The injection is rooted at a probe of a different signal, so the drive is a
+// genuine whole-struct write rather than a read-modify-write.
+// CHECK-LABEL: @NoNarrowForeignProbe
+hw.module @NoNarrowForeignProbe(in %av: i2, in %bv: i2, out o: !hw.struct<a: i2, b: i2>) {
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  %init = hw.aggregate_constant [0 : i2, 0 : i2] : !hw.struct<a: i2, b: i2>
+  // CHECK: llhd.sig
+  %sig = llhd.sig %init : !hw.struct<a: i2, b: i2>
+  %other = llhd.sig %init : !hw.struct<a: i2, b: i2>
+  %fb = llhd.sig.struct_extract %sig["b"] : <!hw.struct<a: i2, b: i2>>
+  llhd.drv %fb, %bv after %0 : i2
+  %p = llhd.prb %other : !hw.struct<a: i2, b: i2>
+  %inj = hw.struct_inject %p["a"], %av : !hw.struct<a: i2, b: i2>
+  // CHECK: llhd.drv
+  llhd.drv %sig, %inj after %0 : !hw.struct<a: i2, b: i2>
+  %prb = llhd.prb %sig : !hw.struct<a: i2, b: i2>
+  hw.output %prb : !hw.struct<a: i2, b: i2>
+}
+
+// The outer injection shadows the inner one on the same field. Splitting the
+// chain would turn that into two drives fighting over "a", so it is left alone.
+// CHECK-LABEL: @NoNarrowShadowedField
+hw.module @NoNarrowShadowedField(in %av: i2, in %av2: i2, in %bv: i2, out o: !hw.struct<a: i2, b: i2>) {
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  %init = hw.aggregate_constant [0 : i2, 0 : i2] : !hw.struct<a: i2, b: i2>
+  // CHECK: llhd.sig
+  %sig = llhd.sig %init : !hw.struct<a: i2, b: i2>
+  %fb = llhd.sig.struct_extract %sig["b"] : <!hw.struct<a: i2, b: i2>>
+  llhd.drv %fb, %bv after %0 : i2
+  %p = llhd.prb %sig : !hw.struct<a: i2, b: i2>
+  %inj1 = hw.struct_inject %p["a"], %av : !hw.struct<a: i2, b: i2>
+  %inj2 = hw.struct_inject %inj1["a"], %av2 : !hw.struct<a: i2, b: i2>
+  // CHECK: llhd.drv
+  llhd.drv %sig, %inj2 after %0 : !hw.struct<a: i2, b: i2>
+  %prb = llhd.prb %sig : !hw.struct<a: i2, b: i2>
+  hw.output %prb : !hw.struct<a: i2, b: i2>
+}

@@ -401,6 +401,162 @@ private:
   SmallVector<Operation *> toDelete;
 };
 
+/// One step of a projection into an aggregate: either a named struct field or
+/// an array index. Indices compare by SSA value, which is conservative but
+/// exact enough once CSE has run.
+struct AccessStep {
+  StringAttr field;
+  Value index;
+
+  bool operator==(const AccessStep &other) const {
+    return field == other.field && index == other.index;
+  }
+};
+
+/// Peel the chain of signal projections feeding `ref` and return the root
+/// signal, recording in `path` the steps that lead from the root back to `ref`.
+static Value getRefProjectionPath(Value ref, SmallVectorImpl<AccessStep> &path) {
+  auto start = path.size();
+  while (auto *op = ref.getDefiningOp()) {
+    if (auto getOp = dyn_cast<llhd::SigArrayGetOp>(op)) {
+      path.push_back({{}, getOp.getIndex()});
+      ref = getOp.getInput();
+      continue;
+    }
+    if (auto extractOp = dyn_cast<llhd::SigStructExtractOp>(op)) {
+      path.push_back({extractOp.getFieldAttr(), {}});
+      ref = extractOp.getInput();
+      continue;
+    }
+    break;
+  }
+  std::reverse(path.begin() + start, path.end());
+  return ref;
+}
+
+/// The same for the value-level projections feeding `value`, which is how a
+/// probe of a whole aggregate gets narrowed down to one of its elements.
+static Value getValueProjectionPath(Value value,
+                                    SmallVectorImpl<AccessStep> &path) {
+  auto start = path.size();
+  while (auto *op = value.getDefiningOp()) {
+    if (auto getOp = dyn_cast<hw::ArrayGetOp>(op)) {
+      path.push_back({{}, getOp.getIndex()});
+      value = getOp.getInput();
+      continue;
+    }
+    if (auto extractOp = dyn_cast<hw::StructExtractOp>(op)) {
+      path.push_back({extractOp.getFieldNameAttr(), {}});
+      value = extractOp.getInput();
+      continue;
+    }
+    break;
+  }
+  std::reverse(path.begin() + start, path.end());
+  return value;
+}
+
+/// Rewrite drives that read-modify-write an aggregate to drive only the fields
+/// they actually change:
+///
+/// ```
+/// %p = llhd.prb %ref
+/// %v = hw.struct_inject %p["f"], %x
+/// llhd.drv %ref, %v after %t
+/// ```
+///
+/// becomes
+///
+/// ```
+/// %f = llhd.sig.struct_extract %ref["f"]
+/// llhd.drv %f, %x after %t
+/// ```
+///
+/// Frontends produce the wide form for an `always_comb` that assigns a single
+/// field, since the untouched fields have to be carried over from the probe.
+/// That makes the drive span the whole aggregate and overlap any sibling drives
+/// on the other fields, which stops `SigPromoter` from promoting the signal.
+/// The narrow form reaches the same fixpoint -- re-driving a field with the
+/// value just probed off it is a no-op -- without the spurious overlap.
+static void narrowReadModifyWriteDrives(hw::HWModuleOp moduleOp) {
+  SmallVector<llhd::DriveOp> driveOps(moduleOp.getOps<llhd::DriveOp>());
+
+  for (auto driveOp : driveOps) {
+    // A conditional drive leaves the aggregate untouched on some cycles, so the
+    // carried-over fields are load-bearing rather than redundant.
+    if (driveOp.getEnable())
+      continue;
+
+    // Peel off the chain of injections and check that it bottoms out in a probe
+    // of the very signal being driven.
+    SmallVector<hw::StructInjectOp> injectOps;
+    Value current = driveOp.getValue();
+    while (auto injectOp = current.getDefiningOp<hw::StructInjectOp>()) {
+      injectOps.push_back(injectOp);
+      current = injectOp.getInput();
+    }
+    if (injectOps.empty())
+      continue;
+
+    // The injected-into value has to be the very storage being driven. Both
+    // sides may be projections of a larger aggregate, and they need not be
+    // spelled the same way: the drive typically targets a chain of signal
+    // projections, while the probe is taken of the whole signal and narrowed
+    // down with value projections. Compare the two as paths from a common root.
+    SmallVector<AccessStep> refPath, probePath;
+    Value root = getRefProjectionPath(driveOp.getSignal(), refPath);
+
+    Value probed = getValueProjectionPath(current, probePath);
+    auto probeOp = probed.getDefiningOp<llhd::ProbeOp>();
+    if (!probeOp)
+      continue;
+
+    SmallVector<AccessStep> probeRefPath;
+    Value probeRoot = getRefProjectionPath(probeOp.getSignal(), probeRefPath);
+    probeRefPath.append(probePath);
+
+    if (probeRoot != root || probeRefPath != refPath)
+      continue;
+
+    // Everything has to sit in the drive's block so the projections we create
+    // stay in scope and keep their position relative to the other drives.
+    if (probeOp->getBlock() != driveOp->getBlock() ||
+        llvm::any_of(injectOps, [&](auto injectOp) {
+          return injectOp->getBlock() != driveOp->getBlock();
+        }))
+      continue;
+
+    // An outer injection shadows an inner one on the same field. Splitting the
+    // chain would turn that into two drives fighting over one field, so leave
+    // the drive alone.
+    SmallPtrSet<Attribute, 4> seenFields;
+    if (llvm::any_of(injectOps, [&](auto injectOp) {
+          return !seenFields.insert(injectOp.getFieldNameAttr()).second;
+        }))
+      continue;
+
+    LLVM_DEBUG(llvm::dbgs()
+               << "  - Narrowing read-modify-write drive " << driveOp << "\n");
+
+    OpBuilder builder(driveOp);
+    for (auto injectOp : injectOps) {
+      Value fieldRef = llhd::SigStructExtractOp::create(
+          builder, injectOp.getLoc(), driveOp.getSignal(),
+          injectOp.getFieldNameAttr());
+      llhd::DriveOp::create(builder, driveOp.getLoc(), fieldRef,
+                            injectOp.getNewValue(), driveOp.getTime(), Value());
+    }
+    driveOp.erase();
+
+    // The injections and the probe are dead unless something else reads them.
+    for (auto injectOp : llvm::reverse(injectOps))
+      if (injectOp->use_empty())
+        injectOp->erase();
+    if (probeOp->use_empty())
+      probeOp->erase();
+  }
+}
+
 struct Sig2RegPass : public circt::llhd::impl::Sig2RegBase<Sig2RegPass> {
   void runOnOperation() override;
 };
@@ -411,6 +567,8 @@ void Sig2RegPass::runOnOperation() {
 
   LLVM_DEBUG(llvm::dbgs() << "=== Sig2Reg in module " << moduleOp.getSymName()
                           << "\n\n");
+
+  narrowReadModifyWriteDrives(moduleOp);
 
   for (auto sigOp :
        llvm::make_early_inc_range(moduleOp.getOps<llhd::SignalOp>())) {
