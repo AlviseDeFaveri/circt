@@ -118,6 +118,10 @@ void ProbeHoister::findValuesLiveAcrossWait(Liveness &liveness) {
 /// all predecessors are `llhd.wait` ops, and the entry block. Only waits
 /// without any side-effecting op in between themselves and the beginning of the
 /// block can be hoisted.
+///
+/// Probes in `llhd.combinational` regions are hoisted from any block, not just
+/// the entry block, if the region is otherwise free of side effects. See
+/// `canHoistFromAllBlocks` below.
 void ProbeHoister::hoistProbes() {
   auto findExistingProbe = [&](Value signal) {
     for (auto *user : signal.getUsers())
@@ -127,10 +131,26 @@ void ProbeHoister::hoistProbes() {
     return ProbeOp{};
   };
 
+  // A `llhd.combinational` region contains no `llhd.wait` ops, so the only
+  // block we would otherwise hoist from is the entry block. That leaves probes
+  // guarded by control flow stranded inside the region, which in turn keeps the
+  // region side-effecting and blocks control flow removal and inlining.
+  //
+  // If such a region has no side effects besides the probes themselves, no
+  // drive can perturb the probed signals while it executes. Every probe
+  // therefore observes the same value it would at the region's entry, and we
+  // can hoist probes out of any block.
+  bool canHoistFromAllBlocks =
+      isa<CombinationalOp>(region.getParentOp()) &&
+      llvm::all_of(region.getOps(), [](Operation &op) {
+        return isa<ProbeOp>(op) || isMemoryEffectFree(&op);
+      });
+
   for (auto &block : region) {
     // We can only hoist probes in blocks where all predecessors have wait
     // terminators.
-    if (!llvm::all_of(block.getPredecessors(), [](auto *predecessor) {
+    if (!canHoistFromAllBlocks &&
+        !llvm::all_of(block.getPredecessors(), [](auto *predecessor) {
           return isa<WaitOp>(predecessor->getTerminator());
         }))
       continue;

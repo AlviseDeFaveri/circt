@@ -545,6 +545,11 @@ void circt::populateLlhdToCorePipeline(
   modulePM.addPass(llhd::createHoistSignalsPass());
   modulePM.addPass(llhd::createDeseqPass());
   modulePM.addPass(llhd::createLowerProcessesPass());
+  // `Deseq` and `LowerProcesses` create `llhd.combinational` ops that the run of
+  // `HoistSignals` above never saw. Hoist probes out of those as well: a probe
+  // left inside keeps the region side-effecting, which prevents `RemoveControlFlow`
+  // and the `llhd.combinational` canonicalizer from collapsing it into dataflow.
+  modulePM.addPass(llhd::createHoistSignalsPass());
   modulePM.addPass(mlir::createCSEPass());
   modulePM.addPass(mlir::createCanonicalizerPass());
 

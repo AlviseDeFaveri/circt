@@ -369,6 +369,96 @@ hw.module @DriveOnlyInNonSuspendBlock(in %v : f64, in %w : i42, in %c : i1) {
   }
 }
 
+// A `llhd.combinational` region has no waits, so probes guarded by control flow
+// can be hoisted out of any block as long as the region is free of side
+// effects. Otherwise they keep the region side-effecting, which blocks control
+// flow removal and inlining.
+// CHECK-LABEL: @HoistProbesFromCombinationalBlocks
+hw.module @HoistProbesFromCombinationalBlocks(in %c : i1, in %v : i42, out z : i42) {
+  %c0_i42 = hw.constant 0 : i42
+  %a = llhd.sig %c0_i42 : i42
+  // CHECK: llhd.sig
+  // CHECK-NEXT: [[A:%.+]] = llhd.prb %a
+  // CHECK-NEXT: llhd.combinational -> i42
+  %0 = llhd.combinational -> i42 {
+    // CHECK-NOT: llhd.prb
+    cf.cond_br %c, ^bb1, ^bb2(%v : i42)
+  ^bb1:
+    %1 = llhd.prb %a : i42
+    // CHECK: cf.br ^bb2([[A]] : i42)
+    cf.br ^bb2(%1 : i42)
+  ^bb2(%2: i42):
+    llhd.yield %2 : i42
+  }
+  hw.output %0 : i42
+}
+
+// Probes of the same signal in different blocks collapse into a single hoisted
+// probe.
+// CHECK-LABEL: @DedupHoistedProbesAcrossCombinationalBlocks
+hw.module @DedupHoistedProbesAcrossCombinationalBlocks(in %c : i1, out z : i42) {
+  %c0_i42 = hw.constant 0 : i42
+  %a = llhd.sig %c0_i42 : i42
+  // CHECK: llhd.sig
+  // CHECK-NEXT: [[A:%.+]] = llhd.prb %a
+  // CHECK-NOT: llhd.prb
+  // CHECK: llhd.combinational -> i42
+  %0 = llhd.combinational -> i42 {
+    cf.cond_br %c, ^bb1, ^bb2
+  ^bb1:
+    %1 = llhd.prb %a : i42
+    // CHECK: llhd.yield [[A]]
+    llhd.yield %1 : i42
+  ^bb2:
+    %2 = llhd.prb %a : i42
+    // CHECK: llhd.yield [[A]]
+    llhd.yield %2 : i42
+  }
+  hw.output %0 : i42
+}
+
+// A side-effecting op anywhere in the region means a drive may perturb the
+// probed signal, so probes outside the entry block stay put.
+// CHECK-LABEL: @DontHoistProbesFromCombinationalWithSideEffects
+hw.module @DontHoistProbesFromCombinationalWithSideEffects(in %c : i1, in %v : i42, out z : i42) {
+  %c0_i42 = hw.constant 0 : i42
+  %a = llhd.sig %c0_i42 : i42
+  // CHECK: llhd.combinational -> i42
+  %0 = llhd.combinational -> i42 {
+    // CHECK-NEXT: call @maybe_side_effecting()
+    func.call @maybe_side_effecting() : () -> ()
+    cf.cond_br %c, ^bb1, ^bb2(%v : i42)
+  ^bb1:
+    // CHECK: ^bb1:
+    // CHECK-NEXT: llhd.prb %a
+    %1 = llhd.prb %a : i42
+    cf.br ^bb2(%1 : i42)
+  ^bb2(%2: i42):
+    llhd.yield %2 : i42
+  }
+  hw.output %0 : i42
+}
+
+// The relaxation applies only to `llhd.combinational`. In a process a probe
+// sampled under control flow may observe a different value than one sampled at
+// the top of a resuming block, so this stays conservative.
+// CHECK-LABEL: @DontHoistProbesFromNonResumingProcessBlocks
+hw.module @DontHoistProbesFromNonResumingProcessBlocks(in %c : i1) {
+  %c0_i42 = hw.constant 0 : i42
+  %a = llhd.sig %c0_i42 : i42
+  // CHECK: llhd.process
+  llhd.process {
+    cf.cond_br %c, ^bb1, ^bb2
+  ^bb1:
+    // CHECK: ^bb1:
+    // CHECK-NEXT: llhd.prb %a
+    %0 = llhd.prb %a : i42
+    cf.br ^bb2
+  ^bb2:
+    llhd.halt
+  }
+}
+
 func.func private @use_i42(%arg0: i42)
 func.func private @use_inout_i42(%arg0: !llhd.ref<i42>)
 func.func private @maybe_side_effecting()
