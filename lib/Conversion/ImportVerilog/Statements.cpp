@@ -20,11 +20,87 @@
 #include "slang/ast/symbols/CompilationUnitSymbols.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
 using namespace circt;
 using namespace ImportVerilog;
+
+/// If `stmt` is the block slang wraps around a labeled assertion, such as
+/// `Foo: assert property (...)`, return the block symbol carrying the label.
+static const slang::ast::StatementBlockSymbol *
+getAssertionLabelSymbol(const slang::ast::BlockStatement &stmt) {
+  if (stmt.blockKind != slang::ast::StatementBlockKind::Sequential ||
+      !stmt.blockSymbol || stmt.blockSymbol->name.empty())
+    return nullptr;
+  if (!stmt.body.as_if<slang::ast::ConcurrentAssertionStatement>() &&
+      !stmt.body.as_if<slang::ast::ImmediateAssertionStatement>())
+    return nullptr;
+  return stmt.blockSymbol;
+}
+
+/// Compute the hierarchical name of `symbol` relative to the enclosing module,
+/// such as `gen_block.named_block.Foo`. Generate blocks and interface instances
+/// are named the same way as the variables declared inside of them, e.g.
+/// `g_regs_cut_1.Foo` for an entry of the generate block array `g_regs_cut`,
+/// and `intf_Foo` for an interface instance `intf` expanded into the module.
+static std::string getHierarchicalName(const slang::ast::Symbol &symbol) {
+  // Collect the name of each level, followed by the separator to its child.
+  SmallVector<std::pair<std::string, char>> parts;
+  for (const auto *current = &symbol; current;) {
+    if (current->kind == slang::ast::SymbolKind::CompilationUnit ||
+        current->kind == slang::ast::SymbolKind::Root)
+      break;
+
+    // Stop at the module body. Interface instances are expanded into the
+    // enclosing module, so continue with the interface instance in that case.
+    if (auto *body = current->as_if<slang::ast::InstanceBodySymbol>()) {
+      if (body->getDefinition().definitionKind !=
+              slang::ast::DefinitionKind::Interface ||
+          !body->parentInstance)
+        break;
+      parts.push_back({std::string(body->parentInstance->name), '_'});
+      current = &body->parentInstance->getParentScope()->asSymbol();
+      continue;
+    }
+
+    const auto *parentScope = current->getParentScope();
+    const auto *parent = parentScope ? &parentScope->asSymbol() : nullptr;
+    if (auto *genBlock = current->as_if<slang::ast::GenerateBlockSymbol>()) {
+      if (genBlock->isUninstantiated)
+        return {};
+      bool inArray =
+          parent && parent->kind == slang::ast::SymbolKind::GenerateBlockArray;
+      if (!genBlock->name.empty() || !inArray)
+        parts.push_back({std::string(genBlock->getExternalName()), '.'});
+      if (inArray) {
+        std::string part(parent->as<slang::ast::GenerateBlockArraySymbol>()
+                             .getExternalName());
+        part += '_';
+        if (genBlock->arrayIndex)
+          part += genBlock->arrayIndex->toString();
+        else
+          part += std::to_string(genBlock->constructIndex);
+        parts.push_back({std::move(part), '.'});
+        parentScope = parent->getParentScope();
+        parent = parentScope ? &parentScope->asSymbol() : nullptr;
+      }
+    } else if (!current->name.empty()) {
+      parts.push_back({std::string(current->name), '.'});
+    }
+    current = parent;
+  }
+
+  std::string name;
+  for (auto &[part, separator] : llvm::reverse(parts)) {
+    name += part;
+    name += separator;
+  }
+  if (!name.empty())
+    name.pop_back();
+  return name;
+}
 
 /// Build the message printed by the `$printtimescale` system task. If a module
 /// instance or `$unit` is passed as argument, report that scope's time scale;
@@ -282,6 +358,14 @@ struct StmtVisitor {
     moore::JoinKind kind;
     switch (stmt.blockKind) {
     case slang::ast::StatementBlockKind::Sequential:
+      // Record the hierarchical label of a labeled assertion, such that the
+      // assertion can attach it to the op it creates.
+      if (auto *labelSymbol = getAssertionLabelSymbol(stmt)) {
+        llvm::SaveAndRestore guard(
+            context.assertionLabel,
+            builder.getStringAttr(getHierarchicalName(*labelSymbol)));
+        return context.convertStatement(stmt.body);
+      }
       // Inline standard `begin ... end` blocks into the parent.
       return context.convertStatement(stmt.body);
     case slang::ast::StatementBlockKind::JoinAll:
@@ -919,6 +1003,8 @@ struct StmtVisitor {
 
   // Handle immediate assertion statements.
   LogicalResult visit(const slang::ast::ImmediateAssertionStatement &stmt) {
+    // Consume the label such that assertions in the action blocks don't see it.
+    auto label = std::exchange(context.assertionLabel, {});
     auto cond = context.convertRvalueExpression(stmt.cond);
     cond = context.convertToBool(cond);
     if (!cond)
@@ -934,13 +1020,13 @@ struct StmtVisitor {
 
       switch (stmt.assertionKind) {
       case slang::ast::AssertionKind::Assert:
-        moore::AssertOp::create(builder, loc, defer, cond, StringAttr{});
+        moore::AssertOp::create(builder, loc, defer, cond, label);
         return success();
       case slang::ast::AssertionKind::Assume:
-        moore::AssumeOp::create(builder, loc, defer, cond, StringAttr{});
+        moore::AssumeOp::create(builder, loc, defer, cond, label);
         return success();
       case slang::ast::AssertionKind::CoverProperty:
-        moore::CoverOp::create(builder, loc, defer, cond, StringAttr{});
+        moore::CoverOp::create(builder, loc, defer, cond, label);
         return success();
       default:
         break;
@@ -994,6 +1080,7 @@ struct StmtVisitor {
   // Handle concurrent assertion statements.
   LogicalResult visit(const slang::ast::ConcurrentAssertionStatement &stmt) {
     auto loc = context.convertLocation(stmt.sourceRange);
+    auto label = std::exchange(context.assertionLabel, {});
 
     // Check for a `disable iff` expression:
     // `disable iff` can only appear at the outermost property that is asserted,
@@ -1040,13 +1127,13 @@ struct StmtVisitor {
     if (!stmt.ifTrue || stmt.ifTrue->as_if<slang::ast::EmptyStatement>()) {
       switch (stmt.assertionKind) {
       case slang::ast::AssertionKind::Assert:
-        verif::AssertOp::create(builder, loc, property, enable, StringAttr{});
+        verif::AssertOp::create(builder, loc, property, enable, label);
         return success();
       case slang::ast::AssertionKind::Assume:
-        verif::AssumeOp::create(builder, loc, property, enable, StringAttr{});
+        verif::AssumeOp::create(builder, loc, property, enable, label);
         return success();
       case slang::ast::AssertionKind::CoverProperty:
-        verif::CoverOp::create(builder, loc, property, enable, StringAttr{});
+        verif::CoverOp::create(builder, loc, property, enable, label);
         return success();
       default:
         break;
