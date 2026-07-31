@@ -176,6 +176,48 @@ public:
 
                 return success();
               })
+              .Case<llhd::SigStructExtractOp>(
+                  [&](llhd::SigStructExtractOp extractOp) {
+                    // The first field of a struct occupies the most significant
+                    // bits, so a field sits at an offset given by the combined
+                    // width of all the fields that follow it.
+                    if (!offset.isStatic()) {
+                      LLVM_DEBUG(llvm::dbgs() << "  - Dynamic struct offset, "
+                                                 "skipping...\n\n");
+                      return failure();
+                    }
+
+                    // Unions share a single storage location for all their
+                    // members, which the offset model cannot express.
+                    auto structType = dyn_cast<hw::StructType>(
+                        cast<llhd::RefType>(extractOp.getInput().getType())
+                            .getNestedType());
+                    if (!structType) {
+                      LLVM_DEBUG(llvm::dbgs() << "  - Union field access, "
+                                                 "skipping...\n\n");
+                      return failure();
+                    }
+
+                    auto elements = structType.getElements();
+                    auto index =
+                        structType.getFieldIndex(extractOp.getFieldAttr());
+                    if (!index)
+                      return failure();
+
+                    uint64_t fieldOffset = 0;
+                    for (auto field : elements.drop_front(*index + 1)) {
+                      auto bw = hw::getBitWidth(field.type);
+                      if (bw < 0)
+                        return failure();
+                      fieldOffset += bw;
+                    }
+
+                    for (auto *user : extractOp->getUsers())
+                      stack.emplace_back(user,
+                                         Offset(fieldOffset + offset.min));
+
+                    return success();
+                  })
               .Default([](auto *op) {
                 LLVM_DEBUG(llvm::dbgs() << "  - User that is not a probe or "
                                            "drive, skipping...\n    "
