@@ -138,6 +138,11 @@ struct PrefixingInliner : public InlinerInterface {
       op->setAttr("name", updateName(name));
     if (auto name = op->getAttrOfType<StringAttr>("instanceName"))
       op->setAttr("instanceName", updateName(name));
+    // Assertion labels, such as the one on `verif.assert`, identify the
+    // assertion within its module. Prefix them like names to keep them unique
+    // and reflect the full instance hierarchy.
+    if (auto label = op->getAttrOfType<StringAttr>("label"))
+      op->setAttr("label", updateName(label));
     if (auto namesAttr = op->getAttrOfType<ArrayAttr>("names")) {
       SmallVector<Attribute> names(namesAttr.getValue().begin(),
                                    namesAttr.getValue().end());

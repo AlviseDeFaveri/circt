@@ -79,6 +79,30 @@ hw.module private @NamesC() {
 }
 
 
+// Assertion labels are prefixed with the instance path like names.
+// CHECK-LABEL: hw.module @LabelsA
+hw.module @LabelsA(in %a: i1) {
+  // CHECK-NOT: hw.instance
+  // CHECK-NEXT: verif.assert %a label "b0/c/x" : i1
+  // CHECK-NEXT: verif.assume %a label "b0/y" : i1
+  // CHECK-NEXT: verif.assert %a label "b1/c/x" : i1
+  // CHECK-NEXT: verif.assume %a label "b1/y" : i1
+  // CHECK-NEXT: verif.assert %a : i1
+  hw.instance "b0" @LabelsB(a: %a: i1) -> ()
+  hw.instance "b1" @LabelsB(a: %a: i1) -> ()
+  verif.assert %a : i1
+}
+// CHECK-NOT: hw.module private @LabelsB
+hw.module private @LabelsB(in %a: i1) {
+  hw.instance "c" @LabelsC(a: %a: i1) -> ()
+  verif.assume %a label "y" : i1
+}
+// CHECK-NOT: hw.module private @LabelsC
+hw.module private @LabelsC(in %a: i1) {
+  verif.assert %a label "x" : i1
+}
+
+
 // CHECK-LABEL: hw.module @ExtModuleA
 hw.module @ExtModuleA() {
   // CHECK-NEXT: hw.instance "c0" @ExtModuleC
