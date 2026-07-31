@@ -631,6 +631,11 @@ struct Context {
   /// the correct block.
   SmallVector<LoopFrame> loopStack;
 
+  /// The hierarchical label of the assertion statement about to be converted,
+  /// as in `Foo: assert property (...)`. Set while converting the block slang
+  /// wraps around a labeled assertion, and consumed by the assertion itself.
+  StringAttr assertionLabel;
+
   /// A listener called for every variable or net being read. This can be used
   /// to collect all variables read as part of an expression or statement, for
   /// example to populate the list of observed signals in an implicit event
