@@ -715,6 +715,32 @@ static Value packProjections(OpBuilder &builder, Value value,
   return value;
 }
 
+// Check that there is not `wait` block between the def and the use of a
+// projection.
+static bool crossesWait(Block *defBlock, Block *useBlock, Region &region,
+                        DominanceInfo &dominance) {
+  if (defBlock == useBlock)
+    return false;
+  for (auto &block : region) {
+    auto waitOp = dyn_cast<WaitOp>(block.getTerminator());
+    if (!waitOp)
+      continue;
+    if (!dominance.properlyDominates(defBlock, &block))
+      continue;
+    // Forward reachability from this wait's block to useBlock.
+    SmallVector<Block *> worklist{&block};
+    SmallPtrSet<Block *, 8> visited{&block};
+    while (!worklist.empty()) {
+      Block *b = worklist.pop_back_val();
+      if (b == useBlock)
+        return true;
+      for (Block *succ : b->getSuccessors())
+        if (visited.insert(succ).second)
+          worklist.push_back(succ);
+    }
+  }
+  return false;
+}
 //===----------------------------------------------------------------------===//
 // Drive/Probe to SSA Value Promotion
 //===----------------------------------------------------------------------===//
@@ -901,11 +927,14 @@ void Promoter::promoteSlot() {
 
 /// Identify any promotable slots probed or driven under the current region.
 void Promoter::findPromotableSlots() {
+  DominanceInfo dominance(region.getParentOp());
+
   SmallPtrSet<Value, 8> seenSlots;
   SmallPtrSet<Operation *, 8> checkedUsers;
   SmallVector<Operation *, 8> userWorklist;
 
   region.walk([&](Operation *op) {
+    LLVM_DEBUG(llvm::dbgs() << "[ALVISE] Checking Operation " << *op << "\n");
     for (auto operand : op->getOperands()) {
       if (!seenSlots.insert(operand).second)
         continue;
@@ -936,8 +965,13 @@ void Promoter::findPromotableSlots() {
           for (auto *projectionUser : user->getUsers()) {
             if (isa<SigArrayGetOp, SigExtractOp, SigStructExtractOp>(
                     projectionUser) &&
-                projectionUser->getBlock() != user->getBlock())
+                projectionUser->getBlock() != user->getBlock() &&
+                crossesWait(user->getBlock(), projectionUser->getBlock(),
+                            region, dominance))
               return false;
+            LLVM_DEBUG(llvm::dbgs()
+                       << "[ALVISE] User of user " << projectionUser);
+
             hasBlockingDrive |= isBlockingDrive(projectionUser);
             hasDeltaDrive |= isDeltaDrive(projectionUser);
             if (checkedUsers.insert(projectionUser).second)
