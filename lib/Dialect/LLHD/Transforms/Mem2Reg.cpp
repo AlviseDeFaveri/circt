@@ -15,7 +15,13 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/Location.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/IR/Value.h"
+#include "mlir/Support/LLVM.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/GenericIteratedDominanceFrontier.h"
 
@@ -715,6 +721,12 @@ static Value packProjections(OpBuilder &builder, Value value,
   return value;
 }
 
+static bool isProjection(Operation *op) {
+  // For now we only support a subset of the possible projections.
+  // TODO: Add suport for slices and unions.
+  return isa<SigArrayGetOp, SigExtractOp, SigStructExtractOp>(op);
+}
+
 // Check that there is not `wait` block between the def and the use of a
 // projection.
 static bool crossesWait(Block *defBlock, Block *useBlock, Region &region,
@@ -741,6 +753,324 @@ static bool crossesWait(Block *defBlock, Block *useBlock, Region &region,
   }
   return false;
 }
+
+// Bit range, used to determine whether two projections overlap.
+namespace {
+struct BitRange {
+  unsigned offset = 0;
+  unsigned width = 0;
+
+  bool overlaps(BitRange other) const {
+    return offset < other.offset + other.width && other.offset < offset + width;
+  }
+  bool operator==(BitRange other) const {
+    return offset == other.offset && width == other.width;
+  }
+  BitRange relativeTo(BitRange other) const {
+    return BitRange{other.offset + offset, width};
+  }
+};
+} // namespace
+
+/// Compute the range of bits a projection covers within its input signal.
+/// Returns `std::nullopt` if the projection is not statically known, either
+/// because it uses a dynamic index or because a type involved has no known bit
+/// width.
+static std::optional<BitRange> getProjectionRange(Operation *op) {
+  auto width = hw::getBitWidth(getStoredType(op->getResult(0)));
+  if (width < 0)
+    return std::nullopt;
+
+  return TypeSwitch<Operation *, std::optional<BitRange>>(op)
+      .Case<SignalOp>([&](auto *op) -> std::optional<BitRange> {
+        return BitRange{0, unsigned(width)};
+      })
+      .Case<ProbeOp, DriveOp>([&](auto *op) -> std::optional<BitRange> {
+        Operation *parent = op->getOperand(0).getDefiningOp();
+        if (!isa<SignalOp>(parent) && !isProjection(parent))
+          return std::nullopt;
+        return getProjectionRange(parent);
+      })
+      .Case<SigExtractOp>([&](auto *op) -> std::optional<BitRange> {
+        IntegerAttr lowBit;
+        if (!matchPattern(op->getLowBit(), m_Constant(&lowBit)))
+          return std::nullopt;
+        return BitRange{unsigned(lowBit.getValue().getZExtValue()),
+                        unsigned(width)};
+      })
+      .Case<SigArrayGetOp>([&](auto *op) -> std::optional<BitRange> {
+        IntegerAttr index;
+        if (!matchPattern(op->getIndex(), m_Constant(&index)))
+          return std::nullopt;
+        // Array element `i` occupies the bits `[i*width, (i+1)*width)`.
+        return BitRange{unsigned(index.getValue().getZExtValue() * width),
+                        unsigned(width)};
+      })
+      .Case<SigStructExtractOp>([&](auto *op) -> std::optional<BitRange> {
+        auto inputType = getStoredType(op->getInput());
+        // All members of a union alias each other at offset zero.
+        if (hw::type_isa<hw::UnionType>(inputType))
+          return BitRange{0, unsigned(width)};
+        // The last member of a struct occupies the least significant bits,
+        // so a member's offset is the combined width of the members after
+        // it.
+        auto structType = hw::type_cast<hw::StructType>(inputType);
+        auto index = *structType.getFieldIndex(op->getFieldAttr());
+        unsigned offset = 0;
+        for (auto element : structType.getElements().drop_front(index + 1)) {
+          auto elementWidth = hw::getBitWidth(element.type);
+          if (elementWidth < 0)
+            return std::nullopt;
+          offset += elementWidth;
+        }
+        return BitRange{offset, unsigned(width)};
+      })
+
+      // For now we only support a subset of the possible projections.
+      // TODO: Add suport for slices and unions.
+      .Default([](auto) { return std::nullopt; });
+}
+
+//===----------------------------------------------------------------------===//
+// Longest Static Prefix Tree
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+// LSP Nodes
+struct LSPNode {
+  enum class Kind { Signal, Projection, Probe, Drive, Unknown };
+  /// Multiple operations can be assigned to the same node, e.g. aliasing
+  /// projections.
+  SmallVector<Operation *> ops;
+  /// This range should always be computed relative to the root signal.
+  BitRange range;
+
+  LSPNode(Operation *op, BitRange range) : ops({op}), range(range) {
+    kind = TypeSwitch<Operation *, Kind>(op)
+               .Case<SignalOp>([](auto) { return Kind::Signal; })
+               .Case<SigArrayGetOp, SigExtractOp, SigStructExtractOp>(
+                   [](auto) { return Kind::Projection; })
+               .Case<ProbeOp>([](auto) { return Kind::Probe; })
+               .Case<DriveOp>([](auto) { return Kind::Drive; })
+               .Default([](auto) { return Kind::Unknown; });
+  }
+
+  Kind getKind() const { return kind; }
+  bool hasDeltaDrive() const { return llvm::any_of(ops, isDeltaDrive); }
+  bool hasBlockingDrive() const { return llvm::any_of(ops, isBlockingDrive); }
+
+private:
+  /// Assigned once by constructor.
+  Kind kind;
+};
+
+// LSP Edges
+struct Edge {
+  LSPNode *node;
+  bool crossesWait;
+};
+
+/// Longest Static Prefix Tree that maps each probe/drive to a specific
+/// projection of a signal, where possible.
+/// Roots are signals, leafs are Probes/Drives, intermediate nodes are
+/// projections, guaranteed to be non-aliasing by construction.
+class LSPTree {
+public:
+  LSPTree(Region &region, DominanceInfo &dominance)
+      : region(region), dominance(dominance) {}
+
+  /// Add a node corresponding to the longest static prefix of the value used
+  /// by a given Probe or Drive operation.
+  /// This basically means finding which signal is being used and through which
+  /// projections. If an aliasing projection already exists at any point of the
+  /// projection chain, we append a branch to the corresponding node.
+  /// @arg op The Drive or Probe operation for which we want to insert a node
+  /// @arg visited Cache of visited operations, updated by the function
+  /// @return Node inserted in the tree, or nullptr if we cannot reason about
+  ///         this operation/projection chain
+  LSPNode *insert(Operation *op, SmallDenseSet<Operation *> &visited);
+  /// Find chains that are promotable.
+  SmallDenseSet<Value> resolvePromotableSlots() const;
+
+private:
+  /// Create a node for a specific operation, if it does not already exist.
+  /// This doesn't connect the node to anything yet.
+  LSPNode *getOrCreateNode(Operation *op, BitRange range);
+  /// Merge `from` node into `into` nodes.
+  void mergeNodes(LSPNode *from, LSPNode *into);
+
+  Region &region;
+  DominanceInfo &dominance;
+
+  /// Nodes of the tree, owned by the tree.
+  SmallVector<std::unique_ptr<LSPNode>> nodes;
+  /// Edges of the tree, expressed as map<parent, edges_to_children>
+  SmallDenseMap<LSPNode *, SmallVector<Edge>> edges;
+  /// We can have multiple roots if the region drives multiple signals.
+  SmallDenseSet<LSPNode *> roots;
+  /// Lookup from operation to node (aliasing ops can map to the same node).
+  SmallDenseMap<Operation *, LSPNode *> opToNode;
+};
+
+LSPNode *LSPTree::getOrCreateNode(Operation *op, BitRange range) {
+  if (auto *node = opToNode.lookup(op))
+    return node;
+
+  nodes.push_back(std::make_unique<LSPNode>(op, range));
+  opToNode.insert({op, nodes.back().get()});
+  return nodes.back().get();
+}
+
+void LSPTree::mergeNodes(LSPNode *from, LSPNode *into) {
+  // Reassign ops to new node
+  for (auto *op : from->ops) {
+    into->ops.push_back(op);
+    opToNode[op] = into;
+  }
+  // Reassign edges
+  edges[into].append(edges[from]);
+  edges.remove_if([&](auto &edge) -> bool { return edge.first == from; });
+}
+
+LSPNode *LSPTree::insert(Operation *op, SmallDenseSet<Operation *> &visited) {
+  if (!isa<ProbeOp, DriveOp>(op))
+    return nullptr;
+  // Walk up the projection chain until we reach a signal or a projection that
+  // has already been visited. This is the longest static prefix of the access.
+  SmallVector<std::pair<Operation *, bool>> projections;
+  LSPNode *prefix = nullptr;
+  for (auto *curOp = op;; curOp = curOp->getOperand(0).getDefiningOp()) {
+    // Op already in tree? Stop.
+    prefix = opToNode.lookup_or(curOp, nullptr);
+    if (!prefix)
+      break;
+    // Op is a Signal? Create a new root and stop.
+    if (isa<SignalOp>(curOp)) {
+      auto range = getProjectionRange(curOp);
+      if (!range)
+        return nullptr;
+      prefix = getOrCreateNode(curOp, *range);
+      roots.insert(prefix);
+      break;
+    }
+    // If we've already visited this operation but there isn't a corresponding
+    // node in the tree, it means that we bailed out of the analysis before.
+    if (!visited.insert(curOp).second)
+      return nullptr;
+    // We cannot reason about this chain: bail out.
+    if (!isProjection(curOp) && !isa<SignalOp, DriveOp, ProbeOp>(curOp))
+      return nullptr;
+
+    projections.push_back(
+        {curOp, crossesWait(curOp->getOperand(0).getDefiningOp()->getBlock(),
+                            curOp->getBlock(), region, dominance)});
+  }
+  assert(prefix != nullptr);
+
+  // Unwind the projection stack
+  bool foundDynamicIndex = false;
+  while (!projections.empty()) {
+    auto [curOp, crossesWait] = projections.pop_back_val();
+    auto range = getProjectionRange(curOp);
+    if (!range)
+      foundDynamicIndex = true;
+
+    // Dynamic index: we are already at the longest _static_ prefix.
+    if (foundDynamicIndex) {
+      opToNode[curOp] = prefix;
+      prefix->ops.push_back(curOp);
+      continue;
+    }
+
+    auto rangeInSignal = range->relativeTo(prefix->range);
+
+    // Check for aliases with the current node or its children if it's a
+    // projection.
+    if (isProjection(op)) {
+      LSPNode *fullyAliasing = nullptr;
+      SmallDenseSet<LSPNode *> partiallyAliasing;
+      if (rangeInSignal == prefix->range) {
+        fullyAliasing = prefix;
+      } else {
+        for (auto &[child, _] : edges[prefix]) {
+          if (rangeInSignal == child->range) {
+            assert(fullyAliasing == nullptr);
+            fullyAliasing = child;
+          } else if (rangeInSignal.overlaps(child->range)) {
+            assert(fullyAliasing == nullptr);
+            partiallyAliasing.insert(child);
+          }
+        }
+      }
+      // Fold all partial aliases into the parent.
+      if (partiallyAliasing.size() > 0) {
+        for (auto &aliasingNode : partiallyAliasing)
+          mergeNodes(aliasingNode, prefix);
+        fullyAliasing = prefix;
+      }
+      // Add the current op to the existing node.
+      if (fullyAliasing) {
+        fullyAliasing->ops.push_back(curOp);
+        opToNode[curOp] = fullyAliasing;
+        continue;
+      }
+    }
+
+    // No aliases and no dynamic indexes: create a new node.
+    auto *newNode = getOrCreateNode(op, rangeInSignal);
+    assert(newNode);
+    edges.lookup_or(prefix, {}).push_back({newNode, crossesWait});
+    prefix = newNode;
+  }
+
+  return prefix;
+}
+
+SmallDenseSet<Value> LSPTree::resolvePromotableSlots() const {
+  SmallDenseSet<Value> promotable;
+
+  for (const LSPNode *root : roots) {
+    SmallVector<const LSPNode *> visitStack = {root};
+    SmallVector<Value> accumulated = {};
+    assert(root->ops.size() == 1 && isa<SignalOp>(root->ops[0]) &&);
+
+    while (!visitStack.empty()) {
+      const auto *curNode = visitStack.pop_back_val();
+      for (Operation *op : curNode->ops)
+        accumulated.push_back(op->getResult(0));
+
+      const auto &curEdges = edges.lookup(curNode);
+      bool hasDeltaDrive = false;
+      bool hasBlockingDrive = false;
+      bool hasWaitCrossingEdge = false;
+      for (const auto &[child, crossesWait] : curEdges) {
+        hasWaitCrossingEdge |= crossesWait;
+        if (child->getKind() == LSPNode::Kind::Drive) {
+          hasDeltaDrive |= child->hasDeltaDrive();
+          hasBlockingDrive |= child->hasBlockingDrive();
+        }
+        visitStack.push_back(child);
+      }
+
+      if (hasWaitCrossingEdge)
+        break;
+
+      if (hasDeltaDrive && hasBlockingDrive)
+        break;
+
+      if (hasDeltaDrive || hasBlockingDrive) {
+        promotable.insert_range(accumulated);
+        break;
+      }
+    }
+  }
+
+  return promotable;
+}
+
+} // namespace
+
 //===----------------------------------------------------------------------===//
 // Drive/Probe to SSA Value Promotion
 //===----------------------------------------------------------------------===//
@@ -928,96 +1258,17 @@ void Promoter::promoteSlot() {
 /// Identify any promotable slots probed or driven under the current region.
 void Promoter::findPromotableSlots() {
   DominanceInfo dominance(region.getParentOp());
-  SmallPtrSet<Value, 8> seenSlots;
-  SmallPtrSet<Operation *, 8> checkedUsers;
-  SmallVector<Operation *, 8> userWorklist;
+  LSPTree lspTree(region, dominance);
+  SmallDenseSet<Operation *> visited;
 
   region.walk([&](Operation *op) {
-    for (auto operand : op->getOperands()) {
-      if (!seenSlots.insert(operand).second)
-        continue;
-
-      // We can only promote probes and drives on a locally-defined signal.
-      // Other signals, such as the ones brought into a module through a port,
-      // have an unknown aliasing relationship with the other ports.
-      if (!operand.getDefiningOp<llhd::SignalOp>())
-        continue;
-
-      // Ensure the slot is not used in any way we cannot reason about.
-      bool hasProjection = false;
-      bool hasBlockingDrive = false;
-      bool hasDeltaDrive = false;
-      auto checkUser = [&](Operation *user) -> bool {
-        // We don't support nested probes and drives.
-        if (region.isProperAncestor(user->getParentRegion()))
-          return false;
-        // Ignore uses outside of the region.
-        if (user->getParentRegion() != &region)
-          return true;
-        // Projection operations are okay, as long as nested projections
-        // stay in the same block. Cross-block nested projections would break
-        // during promotion because the projection chain gets severed when
-        // Mem2Reg rewrites signal references into SSA block arguments.
-        if (isa<SigArrayGetOp, SigExtractOp, SigStructExtractOp>(user)) {
-          hasProjection = true;
-          for (auto *projectionUser : user->getUsers()) {
-            if (isa<SigArrayGetOp, SigExtractOp, SigStructExtractOp>(
-                    projectionUser) &&
-                projectionUser->getBlock() != user->getBlock() &&
-                crossesWait(user->getBlock(), projectionUser->getBlock(),
-                            region, dominance))
-              return false;
-            hasBlockingDrive |= isBlockingDrive(projectionUser);
-            hasDeltaDrive |= isDeltaDrive(projectionUser);
-            if (checkedUsers.insert(projectionUser).second)
-              userWorklist.push_back(projectionUser);
-          }
-          projections.insert({user->getResult(0), operand});
-          return true;
-        }
-        hasBlockingDrive |= isBlockingDrive(user);
-        hasDeltaDrive |= isDeltaDrive(user);
-        return isa<ProbeOp>(user) || isBlockingDrive(user) ||
-               isDeltaDrive(user);
-      };
-      checkedUsers.clear();
-      if (!llvm::all_of(operand.getUsers(), [&](auto *user) {
-            auto allOk = true;
-            if (checkedUsers.insert(user).second)
-              userWorklist.push_back(user);
-            while (!userWorklist.empty() && allOk)
-              allOk &= checkUser(userWorklist.pop_back_val());
-            userWorklist.clear();
-            return allOk;
-          }))
-        continue;
-
-      // Don't promote slots that have projections and a mix of blocking and
-      // delta drives. A blocking drive erases the delayed reaching definition,
-      // which leaves delta projection drives without a reaching definition.
-      if (hasProjection && hasBlockingDrive && hasDeltaDrive)
-        continue;
-
-      // Mem2Reg may have to materialize a zero value for promoted slots. Skip
-      // signal types for which we cannot create a suitable default.
-      if (!isPromotableSlotType(getStoredType(operand)))
-        continue;
-
-      slots.push_back(operand);
-    }
+    if (isa<ProbeOp, DriveOp>(op))
+      lspTree.insert(op, visited);
   });
+  promotable = lspTree.resolvePromotableSlots();
 
-  // Populate `promotable` with the slots and projections we are promoting.
-  promotable.insert(slots.begin(), slots.end());
-  projections.remove_if([&](auto elem) {
-    auto [projection, slot] = elem;
-    return !promotable.contains(slot);
-  });
-  for (auto [projection, slot] : projections)
-    promotable.insert(projection);
-
-  LLVM_DEBUG(llvm::dbgs() << "Found " << slots.size() << " promotable slots, "
-                          << promotable.size() << " promotable values\n");
+  LLVM_DEBUG(llvm::dbgs() << "Found " << promotable.size()
+                          << " promotable values\n");
 }
 
 /// Resolve SSA values in `projection` to the `slot` they are projecting into.
