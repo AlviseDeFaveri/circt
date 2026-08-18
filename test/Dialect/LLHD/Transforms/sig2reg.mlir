@@ -180,3 +180,54 @@ hw.module @RemoveDriveOnlySignals(in %d: i42, in %e: i1) {
   llhd.drv %b, %d after %1 if %e : i42
   // CHECK: hw.output
 }
+
+// Constant array indices become a bit offset of index * element width, which
+// lets partially driven aggregate signals promote.
+// CHECK-LABEL: @ArrayGetProjection
+hw.module @ArrayGetProjection(in %in: i1, out o : !hw.array<2xi8>) {
+  %true = hw.constant true
+  %c1_i1 = hw.constant 1 : i1
+  %c0_i3 = hw.constant 0 : i3
+  %init = hw.aggregate_constant [0 : i8, 0 : i8] : !hw.array<2xi8>
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  // CHECK-NOT: llhd.sig
+  %sig = llhd.sig %init : !hw.array<2xi8>
+  // CHECK-NOT: llhd.sig.array_get
+  %1 = llhd.sig.array_get %sig[%c1_i1] : <!hw.array<2xi8>>
+  %2 = llhd.sig.extract %1 from %c0_i3 : <i8> -> <i1>
+  // CHECK-NOT: llhd.drv
+  llhd.drv %2, %in after %0 : i1
+  %3 = llhd.prb %sig : !hw.array<2xi8>
+  // CHECK: hw.output
+  hw.output %3 : !hw.array<2xi8>
+}
+
+// Struct fields are laid out with the last field in the least significant bits,
+// so field `a` sits above `b`.
+// CHECK-LABEL: @StructExtractProjection
+hw.module @StructExtractProjection(in %in: i8, out o : !hw.struct<a: i8, b: i8>) {
+  %init = hw.aggregate_constant [0 : i8, 0 : i8] : !hw.struct<a: i8, b: i8>
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  // CHECK-NOT: llhd.sig
+  %sig = llhd.sig %init : !hw.struct<a: i8, b: i8>
+  // CHECK-NOT: llhd.sig.struct_extract
+  %1 = llhd.sig.struct_extract %sig["a"] : <!hw.struct<a: i8, b: i8>>
+  // CHECK-NOT: llhd.drv
+  llhd.drv %1, %in after %0 : i8
+  %2 = llhd.prb %sig : !hw.struct<a: i8, b: i8>
+  // CHECK: hw.output
+  hw.output %2 : !hw.struct<a: i8, b: i8>
+}
+
+// Dynamic array indices are still rejected.
+// CHECK-LABEL: @IgnoreDynamicArrayGet
+hw.module @IgnoreDynamicArrayGet(in %in: i8, in %idx: i1, out o : !hw.array<2xi8>) {
+  %init = hw.aggregate_constant [0 : i8, 0 : i8] : !hw.array<2xi8>
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  // CHECK: llhd.sig
+  %sig = llhd.sig %init : !hw.array<2xi8>
+  %1 = llhd.sig.array_get %sig[%idx] : <!hw.array<2xi8>>
+  llhd.drv %1, %in after %0 : i8
+  %2 = llhd.prb %sig : !hw.array<2xi8>
+  hw.output %2 : !hw.array<2xi8>
+}
