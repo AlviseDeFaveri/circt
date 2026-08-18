@@ -36,6 +36,39 @@ hw.module @InlineCombinational(in %a: i42, in %b: i42, in %c: i8917, out u: i42,
   hw.output %0, %1 : i42, i9001
 }
 
+// A single-block combinational region whose only effects are probes and drives
+// to distinct signals means the same thing in the parent graph region.
+// CHECK-LABEL: hw.module @InlineCombinationalWithDrives(
+hw.module @InlineCombinationalWithDrives(in %a: i1) {
+  %time = llhd.constant_time <0ns, 0d, 1e>
+  %sig1 = llhd.sig %a : i1
+  %sig2 = llhd.sig %a : i1
+  // CHECK-NOT: llhd.combinational
+  // CHECK: [[TMP:%.+]] = llhd.prb %sig1
+  // CHECK: llhd.drv %sig2, [[TMP]]
+  llhd.combinational {
+    %0 = llhd.prb %sig1 : i1
+    llhd.drv %sig2, %0 after %time : i1
+    llhd.yield
+  }
+  hw.output
+}
+
+// Two drives to the same signal must stay put: in the body the second overrides
+// the first, but as separate drivers in the parent they would conflict.
+// CHECK-LABEL: hw.module @IgnoreCombinationalWithAliasingDrives(
+hw.module @IgnoreCombinationalWithAliasingDrives(in %a: i1, in %b: i1) {
+  %time = llhd.constant_time <0ns, 0d, 1e>
+  %sig = llhd.sig %a : i1
+  // CHECK: llhd.combinational
+  llhd.combinational {
+    llhd.drv %sig, %a after %time : i1
+    llhd.drv %sig, %b after %time : i1
+    llhd.yield
+  }
+  hw.output
+}
+
 // CHECK-LABEL: hw.module @IgnoreMultiBlockHalt
 hw.module @IgnoreMultiBlockHalt(in %a : i1, in %b : i1, out v1 : i1, out v2 : i1) {
   // CHECK: llhd.halt %a, %a

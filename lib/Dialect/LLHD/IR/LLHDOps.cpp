@@ -769,16 +769,35 @@ LogicalResult ProcessOp::canonicalize(ProcessOp op, PatternRewriter &rewriter) {
 LogicalResult CombinationalOp::canonicalize(CombinationalOp op,
                                             PatternRewriter &rewriter) {
   // Inline the combinational region if it consists of a single block and
-  // contains no side-effecting operations.
-  if (op.getBody().hasOneBlock() && isMemoryEffectFree(op)) {
-    auto &block = op.getBody().front();
-    auto *terminator = block.getTerminator();
-    rewriter.inlineBlockBefore(&block, op, ValueRange{});
-    rewriter.replaceOp(op, terminator->getOperands());
-    rewriter.eraseOp(terminator);
-    return success();
+  // everything in it means the same thing in the surrounding graph region.
+  // Without control flow the body runs top to bottom whenever any of the values
+  // it uses change, which is exactly how the parent region interprets the same
+  // ops.
+  if (!op.getBody().hasOneBlock())
+    return failure();
+
+  auto &block = op.getBody().front();
+  llvm::SmallDenseSet<Value> drivenSignals;
+  for (auto &bodyOp : block.without_terminator()) {
+    if (isMemoryEffectFree(&bodyOp))
+      continue;
+    // Probes and drives are the ops the parent graph region shares with
+    // procedural regions. Drives may only be inlined if they target distinct
+    // signals: in the body a later drive overrides an earlier one to the same
+    // signal, which no longer holds once they become separate drivers.
+    if (isa<ProbeOp>(bodyOp))
+      continue;
+    if (auto driveOp = dyn_cast<DriveOp>(bodyOp);
+        driveOp && drivenSignals.insert(driveOp.getSignal()).second)
+      continue;
+    return failure();
   }
-  return failure();
+
+  auto *terminator = block.getTerminator();
+  rewriter.inlineBlockBefore(&block, op, ValueRange{});
+  rewriter.replaceOp(op, terminator->getOperands());
+  rewriter.eraseOp(terminator);
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
