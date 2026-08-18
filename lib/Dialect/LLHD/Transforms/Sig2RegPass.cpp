@@ -149,6 +149,72 @@ public:
 
                 return success();
               })
+              .Case<llhd::SigArrayGetOp>([&](llhd::SigArrayGetOp getOp) {
+                // Only constant indices are supported. A dynamic index counts
+                // elements rather than bits, so it cannot join the dynamic
+                // offsets tracked by `Offset` without being scaled first.
+                auto constOp = getOp.getIndex().getDefiningOp<hw::ConstantOp>();
+                if (!constOp || !offset.isStatic()) {
+                  LLVM_DEBUG(llvm::dbgs()
+                             << "  - Dynamic array index, skipping...\n\n");
+                  return failure();
+                }
+
+                auto arrayType = cast<hw::ArrayType>(
+                    cast<llhd::RefType>(getOp.getInput().getType())
+                        .getNestedType());
+                auto bw = hw::getBitWidth(arrayType.getElementType());
+                if (bw <= 0)
+                  return failure();
+
+                auto index = constOp.getValue().getZExtValue();
+                if (index >= arrayType.getNumElements()) {
+                  LLVM_DEBUG(llvm::dbgs() << "  - Array index out of bounds, "
+                                             "skipping...\n\n");
+                  return failure();
+                }
+
+                for (auto *user : getOp->getUsers())
+                  stack.emplace_back(user, Offset(index * bw + offset.min));
+
+                return success();
+              })
+              .Case<llhd::SigStructExtractOp>(
+                  [&](llhd::SigStructExtractOp extractOp) {
+                    if (!offset.isStatic())
+                      return failure();
+
+                    // Union members all alias the same storage, so a member
+                    // access does not describe a distinct interval.
+                    auto structType = dyn_cast<hw::StructType>(
+                        cast<llhd::RefType>(extractOp.getInput().getType())
+                            .getNestedType());
+                    if (!structType) {
+                      LLVM_DEBUG(llvm::dbgs()
+                                 << "  - Union member, skipping...\n\n");
+                      return failure();
+                    }
+
+                    // Fields are laid out with the last one in the least
+                    // significant bits, so the offset is the total width of the
+                    // fields that follow.
+                    auto elements = structType.getElements();
+                    auto index =
+                        *structType.getFieldIndex(extractOp.getFieldAttr());
+                    uint64_t fieldOffset = 0;
+                    for (auto field : elements.drop_front(index + 1)) {
+                      auto fieldWidth = hw::getBitWidth(field.type);
+                      if (fieldWidth < 0)
+                        return failure();
+                      fieldOffset += fieldWidth;
+                    }
+
+                    for (auto *user : extractOp->getUsers())
+                      stack.emplace_back(user,
+                                         Offset(fieldOffset + offset.min));
+
+                    return success();
+                  })
               .Default([](auto *op) {
                 LLVM_DEBUG(llvm::dbgs() << "  - User that is not a probe or "
                                            "drive, skipping...\n    "
