@@ -461,7 +461,6 @@ Value Context::convertSampledValueCallExpression(
   case (1):
   case (2):
     value = this->convertRvalueExpression(*args[0]);
-    originalType = value.getType();
     valTy = dyn_cast<moore::IntType>(value.getType());
     if (!valTy) {
       if (!isa<moore::PackedType>(value.getType())) {
@@ -479,6 +478,11 @@ Value Context::convertSampledValueCallExpression(
         return {};
       }
     }
+
+    // Use the simple bit vector type for converting the result back from a
+    // builtin integer. Packed aggregates are converted back to their original
+    // type at the end, together with all other results.
+    originalType = valTy;
 
     // If the value is four-valued, we need to map it to two-valued before we
     // cast it to a builtin int
