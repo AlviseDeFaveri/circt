@@ -294,6 +294,27 @@ static llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
 // Drive Hoisting
 //===----------------------------------------------------------------------===//
 
+/// Check if an op is one of the `llhd.sig.*` projection ops, which produce a
+/// subsignal aliasing part of their input signal.
+static bool isProjection(Operation *op) {
+  return isa<SigExtractOp, SigArraySliceOp, SigArrayGetOp, SigStructExtractOp>(
+      op);
+}
+
+/// Follow a slot value through any `llhd.sig.*` projections and return the
+/// signal declared by the `llhd.sig` op the slot is rooted in. Returns null if
+/// the slot is not rooted in such an op.
+static Value getRootSignal(Value slot) {
+  while (auto *defOp = slot.getDefiningOp()) {
+    if (isa<llhd::SignalOp>(defOp))
+      return slot;
+    if (!isProjection(defOp))
+      break;
+    slot = defOp->getOperand(0);
+  }
+  return {};
+}
+
 namespace {
 /// The struct performing the hoisting of drives in a process.
 struct DriveHoister {
@@ -308,9 +329,10 @@ struct DriveHoister {
   /// The process we are hoisting drives out of.
   ProcessOp processOp;
 
-  /// The slots for which we are trying to hoist drives. Mostly `llhd.sig` ops
-  /// in practice. This establishes a deterministic order for slots, such that
-  /// everything else in the pass can operate using unordered maps and sets.
+  /// The slots for which we are trying to hoist drives. Either `llhd.sig` ops
+  /// or `llhd.sig.*` projections thereof. This establishes a deterministic
+  /// order for slots, such that everything else in the pass can operate using
+  /// unordered maps and sets.
   SmallSetVector<Value, 8> slots;
   SmallVector<Operation *> suspendOps;
   SmallDenseMap<Value, DriveSet> driveSets;
@@ -328,37 +350,83 @@ void DriveHoister::hoist() {
 /// hoisting. This checks if the slots escape or alias in any way which we
 /// cannot reason about.
 void DriveHoister::findHoistableSlots() {
-  SmallPtrSet<Value, 8> seenSlots;
+  // Group the slots driven in the process by the root signal they project
+  // into. Since drives to different projections of the same root signal may
+  // alias, we can only hoist drives to a root signal if all of them target the
+  // exact same slot. Otherwise hoisting would be free to reorder them.
+  SmallSetVector<Value, 8> roots;
+  SmallDenseMap<Value, Value, 8> rootSlots;
+  SmallPtrSet<Value, 8> conflictingRoots;
+
   processOp.walk([&](DriveOp op) {
     auto slot = op.getSignal();
-    if (!seenSlots.insert(slot).second)
+    auto root = getRootSignal(slot);
+    if (!root)
       return;
+    roots.insert(root);
+    auto &rootSlot = rootSlots[root];
+    if (rootSlot && rootSlot != slot) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "- Aborting root (aliasing drives): " << root << "\n");
+      conflictingRoots.insert(root);
+      return;
+    }
+    rootSlot = slot;
+  });
 
-    // We can only hoist drives to slots declared by a `llhd.sig` op outside the
-    // current region.
-    if (!slot.getDefiningOp<llhd::SignalOp>())
-      return;
+  for (auto root : roots) {
+    if (conflictingRoots.contains(root))
+      continue;
+    auto slot = rootSlots.lookup(root);
+
+    // We can only hoist drives to slots that are available outside the current
+    // region, such that the hoisted drive can refer to them.
     if (!slot.getParentRegion()->isProperAncestor(&processOp.getBody()))
-      return;
+      continue;
 
-    // Ensure the slot is not used in any way we cannot reason about.
-    if (!llvm::all_of(slot.getUsers(), [&](auto *user) {
-          // Ignore uses outside of the region.
-          if (!processOp.getBody().isAncestor(user->getParentRegion()))
-            return true;
-          return isa<ProbeOp, DriveOp>(user);
-        }))
-      return;
+    // Ensure the root signal and all slots aliasing it are not used in any way
+    // we cannot reason about. Since projections are the only way to create an
+    // alias of a signal, following them from the root enumerates the complete
+    // set of aliases.
+    SmallVector<Value, 8> worklist{root};
+    bool unsupportedUse = false;
+    while (!worklist.empty() && !unsupportedUse) {
+      for (auto *user : worklist.pop_back_val().getUsers()) {
+        if (isProjection(user)) {
+          // Projections inside the region create aliases that would no longer
+          // be visible once the drive is hoisted out, so give up on those.
+          if (processOp.getBody().isAncestor(user->getParentRegion())) {
+            unsupportedUse = true;
+            break;
+          }
+          worklist.push_back(user->getResult(0));
+          continue;
+        }
+
+        // Ignore any other uses outside of the region.
+        if (!processOp.getBody().isAncestor(user->getParentRegion()))
+          continue;
+        if (!isa<ProbeOp, DriveOp>(user)) {
+          unsupportedUse = true;
+          break;
+        }
+      }
+    }
+    if (unsupportedUse) {
+      LLVM_DEBUG(llvm::dbgs()
+                 << "- Aborting root (unsupported use): " << root << "\n");
+      continue;
+    }
 
     // Skip slots with types for which we cannot materialize a default
     // constant (needed when yielding values across wait boundaries).
     auto sigType = cast<RefType>(slot.getType()).getNestedType();
     if (!isa<TimeType>(sigType) && !isa<FloatType>(sigType) &&
         hw::getBitWidth(sigType) < 0)
-      return;
+      continue;
 
     slots.insert(slot);
-  });
+  }
   LLVM_DEBUG(llvm::dbgs() << "Found " << slots.size()
                           << " slots for drive hoisting\n");
 }

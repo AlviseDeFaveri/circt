@@ -459,6 +459,93 @@ hw.module @DontHoistProbesFromNonResumingProcessBlocks(in %c : i1) {
   }
 }
 
+// Drives to an `llhd.sig.*` projection of a signal are hoistable as long as the
+// projection itself is available outside the process.
+// CHECK-LABEL: @HoistDrivesToProjections
+hw.module @HoistDrivesToProjections(in %u: i42) {
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  %c0_i1 = hw.constant 0 : i1
+  %arr = hw.aggregate_constant [0 : i42, 0 : i42] : !hw.array<2xi42>
+  %a = llhd.sig %arr : !hw.array<2xi42>
+  // CHECK: [[E:%.+]] = llhd.sig.array_get %a
+  // CHECK: [[EPS:%.+]] = llhd.constant_time <0ns, 0d, 1e>
+  %e = llhd.sig.array_get %a[%c0_i1] : <!hw.array<2xi42>>
+  // CHECK-NEXT: [[RES:%.+]] = llhd.process -> i42 {
+  llhd.process {
+    // CHECK-NOT: llhd.drv
+    llhd.drv %e, %u after %0 : i42
+    // CHECK-NEXT: llhd.halt %u : i42
+    llhd.halt
+  }
+  // CHECK: llhd.drv [[E]], [[RES]] after [[EPS]] :
+}
+
+// Drives to different projections of the same signal may alias, and hoisting
+// them would be free to reorder them. Give up on all of them.
+// CHECK-LABEL: @DontHoistAliasingDrives
+hw.module @DontHoistAliasingDrives(in %u: i42) {
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  %c0_i1 = hw.constant 0 : i1
+  %c1_i1 = hw.constant 1 : i1
+  %arr = hw.aggregate_constant [0 : i42, 0 : i42] : !hw.array<2xi42>
+  %a = llhd.sig %arr : !hw.array<2xi42>
+  // CHECK: [[E0:%.+]] = llhd.sig.array_get %a[%false]
+  // CHECK: [[E1:%.+]] = llhd.sig.array_get %a[%true]
+  %e0 = llhd.sig.array_get %a[%c0_i1] : <!hw.array<2xi42>>
+  %e1 = llhd.sig.array_get %a[%c1_i1] : <!hw.array<2xi42>>
+  // CHECK-NEXT: llhd.process
+  llhd.process {
+    // CHECK-NEXT: llhd.drv [[E0]]
+    llhd.drv %e0, %u after %0 : i42
+    // CHECK-NEXT: llhd.drv [[E1]]
+    llhd.drv %e1, %u after %0 : i42
+    // CHECK-NEXT: llhd.halt
+    llhd.halt
+  }
+}
+
+// A projection created inside the process establishes an alias we can no longer
+// see once the drive is hoisted out.
+// CHECK-LABEL: @DontHoistDrivesToProjectionsInsideProcess
+hw.module @DontHoistDrivesToProjectionsInsideProcess(in %u: i42) {
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  %c0_i1 = hw.constant 0 : i1
+  %arr = hw.aggregate_constant [0 : i42, 0 : i42] : !hw.array<2xi42>
+  %a = llhd.sig %arr : !hw.array<2xi42>
+  // CHECK: llhd.process
+  llhd.process {
+    // CHECK-NEXT: [[E:%.+]] = llhd.sig.array_get %a
+    %e = llhd.sig.array_get %a[%c0_i1] : <!hw.array<2xi42>>
+    // CHECK-NEXT: llhd.drv [[E]]
+    llhd.drv %e, %u after %0 : i42
+    // CHECK-NEXT: llhd.halt
+    llhd.halt
+  }
+}
+
+// An unsavory use of a signal aliasing the driven slot blocks hoisting.
+// CHECK-LABEL: @DontHoistDrivesWithUnsavoryAliasUsers
+hw.module @DontHoistDrivesWithUnsavoryAliasUsers(in %u: i42) {
+  %0 = llhd.constant_time <0ns, 0d, 1e>
+  %c0_i1 = hw.constant 0 : i1
+  %c1_i1 = hw.constant 1 : i1
+  %arr = hw.aggregate_constant [0 : i42, 0 : i42] : !hw.array<2xi42>
+  %a = llhd.sig %arr : !hw.array<2xi42>
+  // CHECK: [[E0:%.+]] = llhd.sig.array_get %a[%false]
+  // CHECK: [[E1:%.+]] = llhd.sig.array_get %a[%true]
+  %e0 = llhd.sig.array_get %a[%c0_i1] : <!hw.array<2xi42>>
+  %e1 = llhd.sig.array_get %a[%c1_i1] : <!hw.array<2xi42>>
+  // CHECK-NEXT: llhd.process
+  llhd.process {
+    // CHECK-NEXT: call @use_inout_i42([[E1]])
+    func.call @use_inout_i42(%e1) : (!llhd.ref<i42>) -> ()
+    // CHECK-NEXT: llhd.drv [[E0]]
+    llhd.drv %e0, %u after %0 : i42
+    // CHECK-NEXT: llhd.halt
+    llhd.halt
+  }
+}
+
 func.func private @use_i42(%arg0: i42)
 func.func private @use_inout_i42(%arg0: !llhd.ref<i42>)
 func.func private @maybe_side_effecting()
