@@ -1805,17 +1805,34 @@ void Promoter::insertProbes() {
 /// Insert a probe directly after a SlotNode that is not a SignalOp. Also move
 /// the slot's projection chain in front of the region's parent op, such that
 /// the slot is defined outside the region like a regular signal.
+///
+/// Signals declared inside the region without an initial value are an
+/// exception: nothing outside the region can observe or drive them, which makes
+/// their contents before the first drive unspecified. Materialize a zero value
+/// instead of a probe for those, such that the region does not keep a
+/// side-effecting op around that would prevent it from being collapsed into
+/// pure dataflow later on.
 void Promoter::insertProbes(SlotNode *node) {
   auto *op = node->op;
 
   if (!node->def && node->valueAfter->needed) {
     OpBuilder builder(op);
     builder.setInsertionPointAfter(op);
-    auto value = ProbeOp::create(builder, currentSlot.getLoc(), currentSlot);
-    node->def = lattice->createDef(value, DriveCondition::never());
 
-    LLVM_DEBUG(llvm::dbgs() << "- Inserting probe for " << currentSlot
-                            << " after " << *op << "\n");
+    if (node->isSignal() && op->getParentRegion() == &region) {
+      auto value = createZeroValue(builder, currentSlot.getLoc(),
+                                   getStoredType(currentSlot));
+      node->def = lattice->createDef(value, DriveCondition::never());
+
+      LLVM_DEBUG(llvm::dbgs() << "- Inserting zero value for " << currentSlot
+                              << " after " << *op << "\n");
+    } else {
+      auto value = ProbeOp::create(builder, currentSlot.getLoc(), currentSlot);
+      node->def = lattice->createDef(value, DriveCondition::never());
+
+      LLVM_DEBUG(llvm::dbgs() << "- Inserting probe for " << currentSlot
+                              << " after " << *op << "\n");
+    }
   }
 
   // The probe stays where the projection was, so moving the projection out
