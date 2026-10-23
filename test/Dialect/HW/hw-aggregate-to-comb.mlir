@@ -310,3 +310,66 @@ hw.module private @union_array(in %arr: !hw.array<2x!hw.union<a: i4, b: i2 offse
   %b = hw.union_extract %e["b"] : !hw.union<a: i4, b: i2 offset 1>
   hw.output %b : i2
 }
+
+// CHECK-LABEL: @struct_explode(
+hw.module private @struct_explode(in %s: !hw.struct<a: i1, b: i2, c: i3>, out a: i1, out b: i2, out c: i3) {
+  // CHECK-NEXT: %[[S:.+]] = hw.bitcast %s : (!hw.struct<a: i1, b: i2, c: i3>) -> i6
+  // CHECK-NEXT: %[[A:.+]] = comb.extract %[[S]] from 5 : (i6) -> i1
+  // CHECK-NEXT: %[[B:.+]] = comb.extract %[[S]] from 3 : (i6) -> i2
+  // CHECK-NEXT: %[[C:.+]] = comb.extract %[[S]] from 0 : (i6) -> i3
+  // CHECK-NEXT: hw.output %[[A]], %[[B]], %[[C]]
+  %a, %b, %c = hw.struct_explode %s : !hw.struct<a: i1, b: i2, c: i3>
+  hw.output %a, %b, %c : i1, i2, i3
+}
+
+// CHECK-LABEL: @struct_inject(
+hw.module private @struct_inject(in %s: !hw.struct<a: i1, b: i2, c: i3>, in %v: i2, in %w: i1, in %x: i3, out mid: !hw.struct<a: i1, b: i2, c: i3>, out first: !hw.struct<a: i1, b: i2, c: i3>, out last: !hw.struct<a: i1, b: i2, c: i3>) {
+  // CHECK-NEXT: %[[S:.+]] = hw.bitcast %s : (!hw.struct<a: i1, b: i2, c: i3>) -> i6
+  // CHECK-NEXT: %[[HI:.+]] = comb.extract %[[S]] from 5 : (i6) -> i1
+  // CHECK-NEXT: %[[LO:.+]] = comb.extract %[[S]] from 0 : (i6) -> i3
+  // CHECK-NEXT: %[[MID:.+]] = comb.concat %[[HI]], %v, %[[LO]] : i1, i2, i3
+  // CHECK-NEXT: %[[MID_CAST:.+]] = hw.bitcast %[[MID]] : (i6) -> !hw.struct<a: i1, b: i2, c: i3>
+  %0 = hw.struct_inject %s["b"], %v : !hw.struct<a: i1, b: i2, c: i3>
+  // CHECK-NEXT: %[[LO:.+]] = comb.extract %[[S]] from 0 : (i6) -> i5
+  // CHECK-NEXT: %[[FIRST:.+]] = comb.concat %w, %[[LO]] : i1, i5
+  // CHECK-NEXT: %[[FIRST_CAST:.+]] = hw.bitcast %[[FIRST]] : (i6) -> !hw.struct<a: i1, b: i2, c: i3>
+  %1 = hw.struct_inject %s["a"], %w : !hw.struct<a: i1, b: i2, c: i3>
+  // CHECK-NEXT: %[[HI:.+]] = comb.extract %[[S]] from 3 : (i6) -> i3
+  // CHECK-NEXT: %[[LAST:.+]] = comb.concat %[[HI]], %x : i3, i3
+  // CHECK-NEXT: %[[LAST_CAST:.+]] = hw.bitcast %[[LAST]] : (i6) -> !hw.struct<a: i1, b: i2, c: i3>
+  %2 = hw.struct_inject %s["c"], %x : !hw.struct<a: i1, b: i2, c: i3>
+  // CHECK-NEXT: hw.output %[[MID_CAST]], %[[FIRST_CAST]], %[[LAST_CAST]]
+  hw.output %0, %1, %2 : !hw.struct<a: i1, b: i2, c: i3>, !hw.struct<a: i1, b: i2, c: i3>, !hw.struct<a: i1, b: i2, c: i3>
+}
+
+// CHECK-LABEL: @aggregate_regs(
+hw.module private @aggregate_regs(in %clk: !seq.clock, in %rst: i1, in %s: !hw.struct<a: i1, b: i2>, in %arr: !hw.array<2xi4>, out o: i2, out p: i4) {
+  // CHECK-DAG: %[[ARR:.+]] = hw.bitcast %arr : (!hw.array<2xi4>) -> i8
+  // CHECK-DAG: %[[S:.+]] = hw.bitcast %s : (!hw.struct<a: i1, b: i2>) -> i3
+  // CHECK-DAG: %[[RESET:.+]] = hw.constant 1 : i3
+  // CHECK: %r = seq.firreg %[[S]] clock %clk reset async %rst, %[[RESET]] : i3
+  // CHECK-NEXT: %[[B:.+]] = comb.extract %r from 0 : (i3) -> i2
+  // CHECK-NEXT: %c = seq.compreg %[[ARR]], %clk : i8
+  // CHECK: %[[E:.+]] = comb.extract %c from 0 : (i8) -> i4
+  // CHECK-NEXT: hw.output %[[B]], %[[E]]
+  %reset = hw.aggregate_constant [false, 1 : i2] : !hw.struct<a: i1, b: i2>
+  %r = seq.firreg %s clock %clk reset async %rst, %reset : !hw.struct<a: i1, b: i2>
+  %b = hw.struct_extract %r["b"] : !hw.struct<a: i1, b: i2>
+  %c = seq.compreg %arr, %clk : !hw.array<2xi4>
+  %false = hw.constant false
+  %e = hw.array_get %c[%false] : !hw.array<2xi4>, i1
+  hw.output %b, %e : i2, i4
+}
+
+// Registers with an initial value keep their type, since the immutable initial
+// value cannot be bitcast.
+// CHECK-LABEL: @reg_with_initial_value(
+hw.module private @reg_with_initial_value(in %clk: !seq.clock, in %s: !hw.struct<a: i1, b: i2>, out o: !hw.struct<a: i1, b: i2>) {
+  %init = seq.initial () {
+    %0 = hw.aggregate_constant [false, 1 : i2] : !hw.struct<a: i1, b: i2>
+    seq.yield %0 : !hw.struct<a: i1, b: i2>
+  } : () -> !seq.immutable<!hw.struct<a: i1, b: i2>>
+  // CHECK: %r = seq.compreg %s, %clk initial %{{.+}} : !hw.struct<a: i1, b: i2>
+  %r = seq.compreg %s, %clk initial %init : !hw.struct<a: i1, b: i2>
+  hw.output %r : !hw.struct<a: i1, b: i2>
+}

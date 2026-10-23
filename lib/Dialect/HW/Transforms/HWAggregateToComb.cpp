@@ -10,6 +10,7 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/HW/HWTypes.h"
+#include "circt/Dialect/Seq/SeqOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/APInt.h"
@@ -339,6 +340,96 @@ struct HWStructExtractOpConversion : OpConversionPattern<hw::StructExtractOp> {
   }
 };
 
+/// Compute the bit offset of each field of a struct, counted from the LSB. The
+/// first field occupies the MSBs.
+static SmallVector<int64_t> getStructFieldOffsets(hw::StructType structType) {
+  SmallVector<int64_t> offsets;
+  int64_t offset = hw::getBitWidth(structType);
+  for (auto field : structType.getElements()) {
+    offset -= hw::getBitWidth(field.type);
+    offsets.push_back(offset);
+  }
+  return offsets;
+}
+
+struct HWStructExplodeOpConversion : OpConversionPattern<hw::StructExplodeOp> {
+  using OpConversionPattern<hw::StructExplodeOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(hw::StructExplodeOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto structType = cast<hw::StructType>(op.getInput().getType());
+    if (hw::getBitWidth(structType) < 0)
+      return rewriter.notifyMatchFailure(op.getLoc(), "unknown struct width");
+
+    // Extract every field using comb.extract.
+    SmallVector<Value> fields;
+    for (auto [field, offset] :
+         llvm::zip(structType.getElements(), getStructFieldOffsets(structType)))
+      fields.push_back(rewriter.createOrFold<comb::ExtractOp>(
+          op.getLoc(), adaptor.getInput(), offset,
+          hw::getBitWidth(field.type)));
+    rewriter.replaceOp(op, fields);
+    return success();
+  }
+};
+
+struct HWStructInjectOpConversion : OpConversionPattern<hw::StructInjectOp> {
+  using OpConversionPattern<hw::StructInjectOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(hw::StructInjectOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto structType = cast<hw::StructType>(op.getInput().getType());
+    int64_t totalBitWidth = hw::getBitWidth(structType);
+    if (totalBitWidth < 0)
+      return rewriter.notifyMatchFailure(op.getLoc(), "unknown struct width");
+
+    // Concatenate the bits above the field, the new value, and the bits below
+    // the field.
+    auto fieldIndex = op.getFieldIndex();
+    int64_t offset = getStructFieldOffsets(structType)[fieldIndex];
+    int64_t fieldWidth =
+        hw::getBitWidth(structType.getElements()[fieldIndex].type);
+    auto input = adaptor.getInput();
+    SmallVector<Value> operands;
+    if (int64_t highBits = totalBitWidth - offset - fieldWidth; highBits > 0)
+      operands.push_back(rewriter.createOrFold<comb::ExtractOp>(
+          op.getLoc(), input, offset + fieldWidth, highBits));
+    operands.push_back(adaptor.getNewValue());
+    if (offset > 0)
+      operands.push_back(rewriter.createOrFold<comb::ExtractOp>(
+          op.getLoc(), input, 0, offset));
+    rewriter.replaceOp(
+        op, rewriter.createOrFold<comb::ConcatOp>(op.getLoc(), operands));
+    return success();
+  }
+};
+
+/// Recreate a register with legalized types.
+struct RegOpConversion : ConversionPattern {
+  RegOpConversion(TypeConverter &typeConverter, MLIRContext *context)
+      : ConversionPattern(typeConverter, MatchAnyOpTypeTag(), 1, context) {}
+
+  LogicalResult
+  matchAndRewrite(Operation *op, ArrayRef<Value> operands,
+                  ConversionPatternRewriter &rewriter) const override {
+    if (!isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp>(op))
+      return failure();
+    auto resultType = typeConverter->convertType(op->getResult(0).getType());
+    if (!resultType)
+      return rewriter.notifyMatchFailure(op, "Failed to convert result type.");
+
+    auto *newOp = rewriter.clone(*op);
+    rewriter.modifyOpInPlace(newOp, [&] {
+      newOp->setOperands(operands);
+      newOp->getResult(0).setType(resultType);
+    });
+    rewriter.replaceOp(op, newOp->getResults());
+    return success();
+  }
+};
+
 struct BitcastOpConversion : OpConversionPattern<hw::BitcastOp> {
   using OpConversionPattern<hw::BitcastOp>::OpConversionPattern;
   // Recreate bitcast with legalized types.
@@ -427,14 +518,15 @@ public:
 
 static void populateHWAggregateToCombOpConversionPatterns(
     RewritePatternSet &patterns, AggregateTypeConverter &typeConverter) {
-  patterns.add<
-      HWArrayGetOpConversion, HWArrayCreateLikeOpConversion<hw::ArrayCreateOp>,
-      HWArrayCreateLikeOpConversion<hw::ArrayConcatOp>,
-      HWAggregateConstantOpConversion, HWArraySliceOpConversion,
-      HWArrayInjectOpConversion, HWStructCreateOpConversion,
-      HWStructExtractOpConversion, HWUnionCreateOpConversion,
-      HWUnionExtractOpConversion, BitcastOpConversion, MuxOpConversion>(
-      typeConverter, patterns.getContext());
+  patterns.add<HWArrayGetOpConversion,
+               HWArrayCreateLikeOpConversion<hw::ArrayCreateOp>,
+               HWArrayCreateLikeOpConversion<hw::ArrayConcatOp>,
+               HWAggregateConstantOpConversion, HWArraySliceOpConversion,
+               HWArrayInjectOpConversion, HWStructCreateOpConversion,
+               HWStructExtractOpConversion, HWStructExplodeOpConversion,
+               HWStructInjectOpConversion, HWUnionCreateOpConversion,
+               HWUnionExtractOpConversion, BitcastOpConversion, MuxOpConversion,
+               RegOpConversion>(typeConverter, patterns.getContext());
 }
 
 namespace {
@@ -451,6 +543,7 @@ void HWAggregateToCombPass::runOnOperation() {
   target.addIllegalOp<hw::ArrayGetOp, hw::ArrayCreateOp, hw::ArrayConcatOp,
                       hw::AggregateConstantOp, hw::ArrayInjectOp,
                       hw::ArraySliceOp, hw::StructCreateOp, hw::StructExtractOp,
+                      hw::StructExplodeOp, hw::StructInjectOp,
                       hw::UnionCreateOp, hw::UnionExtractOp>();
   target.addLegalDialect<hw::HWDialect, comb::CombDialect>();
 
@@ -460,6 +553,19 @@ void HWAggregateToCombPass::runOnOperation() {
 
   target.addDynamicallyLegalOp<comb::MuxOp, hw::BitcastOp>(
       [&typeConverter](auto op) { return typeConverter.isLegal(op); });
+
+  // Registers with an initial value are left untouched, since the initial
+  // value is an immutable value that cannot be bitcast.
+  target.addDynamicallyLegalOp<seq::FirRegOp>([&](seq::FirRegOp op) {
+    return typeConverter.isLegal(op.getOperation());
+  });
+  target.addDynamicallyLegalOp<seq::CompRegOp>([&](seq::CompRegOp op) {
+    return typeConverter.isLegal(op.getOperation()) || op.getInitialValue();
+  });
+  target.addDynamicallyLegalOp<seq::CompRegClockEnabledOp>(
+      [&](seq::CompRegClockEnabledOp op) {
+        return typeConverter.isLegal(op.getOperation()) || op.getInitialValue();
+      });
 
   if (failed(mlir::applyPartialConversion(getOperation(), target,
                                           std::move(patterns))))
