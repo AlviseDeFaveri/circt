@@ -52,6 +52,24 @@ def Sig2RegPass : Pass<"llhd-sig2reg", "hw::HWModuleOp"> {
   ];
 }
 
+def UndrivenToSymbolicPass
+    : Pass<"llhd-undriven-to-symbolic", "hw::HWModuleOp"> {
+  let summary = "Replace undriven signals with symbolic values";
+  let description = [{
+    Replaces signals that have no initial value and are never driven with a
+    `verif.symbolic_value`. Such signals start with an unknown value that
+    nothing ever overwrites, which formal flows treat as an unconstrained input
+    that may change arbitrarily between timesteps. All probes of the signal and
+    of its projections are replaced with the symbolic value, or the projected
+    portion of it.
+  }];
+  let dependentDialects = [
+    "circt::comb::CombDialect",
+    "circt::hw::HWDialect",
+    "circt::verif::VerifDialect",
+  ];
+}
+
 def Mem2RegPass : Pass<"llhd-mem2reg"> {
   let summary = "Promotes memory and signal slots into values.";
   let dependentDialects = [
