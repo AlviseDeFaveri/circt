@@ -24,6 +24,17 @@ def LowerSeqCompRegCE : Pass<"lower-seq-compreg-ce", "hw::HWModuleOp"> {
   let dependentDialects = ["circt::comb::CombDialect, circt::hw::HWDialect"];
 }
 
+def CompRegToFirReg : Pass<"seq-compreg-to-firreg", "hw::HWModuleOp"> {
+  let summary = "Convert seq.compreg to seq.firreg";
+  let description = [{
+    Replaces every `seq.compreg` with an equivalent `seq.firreg`. The reset of a
+    `seq.compreg` becomes a synchronous reset, and a constant integer initial
+    value becomes the preset of the `seq.firreg`. Registers with an initial
+    value that is not a constant integer are left untouched. Run
+    `lower-seq-compreg-ce` first to also convert `seq.compreg.ce`.
+  }];
+}
+
 def LowerSeqFIFO : Pass<"lower-seq-fifo", "hw::HWModuleOp"> {
   let summary = "Lower seq.fifo ops";
   let dependentDialects = [
