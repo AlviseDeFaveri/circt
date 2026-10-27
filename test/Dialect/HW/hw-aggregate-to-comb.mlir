@@ -322,3 +322,14 @@ hw.module private @struct_inject(in %s: !hw.struct<a: i3, b: i4, c: i5>, in %val
   %0 = hw.struct_inject %s["b"], %val : !hw.struct<a: i3, b: i4, c: i5>
   hw.output %0 : !hw.struct<a: i3, b: i4, c: i5>
 }
+
+// CHECK-LABEL: @struct_explode(
+hw.module private @struct_explode(in %s: !hw.struct<a: i1, b: i2, c: i3>, out a: i1, out b: i2, out c: i3) {
+  // CHECK-NEXT: %[[S:.+]] = hw.bitcast %s : (!hw.struct<a: i1, b: i2, c: i3>) -> i6
+  // CHECK-NEXT: %[[A:.+]] = comb.extract %[[S]] from 5 : (i6) -> i1
+  // CHECK-NEXT: %[[B:.+]] = comb.extract %[[S]] from 3 : (i6) -> i2
+  // CHECK-NEXT: %[[C:.+]] = comb.extract %[[S]] from 0 : (i6) -> i3
+  // CHECK-NEXT: hw.output %[[A]], %[[B]], %[[C]]
+  %a, %b, %c = hw.struct_explode %s : !hw.struct<a: i1, b: i2, c: i3>
+  hw.output %a, %b, %c : i1, i2, i3
+}
