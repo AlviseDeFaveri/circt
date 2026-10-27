@@ -548,6 +548,7 @@ void circt::populateLlhdToCorePipeline(
   modulePM.addPass(mlir::createCanonicalizerPass());
   modulePM.addPass(llhd::createDeseqPass());
   modulePM.addPass(llhd::createLowerProcessesPass());
+  modulePM.addPass(llhd::createHoistSignalsPass());
   modulePM.addPass(mlir::createCSEPass());
   modulePM.addPass(mlir::createCanonicalizerPass());
 

@@ -362,10 +362,11 @@ LogicalResult Deseq::deseq() {
 /// the wait and drive ops that are relevant.
 bool Deseq::analyzeProcess() {
   // We can only desequentialize processes with no side-effecting ops besides
-  // the `WaitOp` or `HaltOp` terminators.
+  // the `WaitOp` or `HaltOp` terminators. `ProbeOp`s are also fine if they
+  // execute after the wait, which is checked further down.
   for (auto &block : process.getBody()) {
     for (auto &op : block) {
-      if (isa<WaitOp, HaltOp>(op))
+      if (isa<WaitOp, HaltOp, ProbeOp>(op))
         continue;
       if (!isMemoryEffectFree(&op)) {
         LLVM_DEBUG({
@@ -393,6 +394,32 @@ bool Deseq::analyzeProcess() {
   if (!wait) {
     LLVM_DEBUG(llvm::dbgs()
                << "Skipping " << process.getLoc() << ": has no wait\n");
+    return false;
+  }
+
+  // The process has exactly one wait and no drive.
+  // Every probe executed after the wait samples its signal at the trigger
+  // event that resumed the process, which matches the register we are creating.
+  // On the other hand, probes on the path from the entry block to the wait
+  // only execute once, so we must skip them.
+  SmallPtrSet<Block *, 8> initialBlocks;
+  SmallVector<Block *> worklist = {&process.getBody().front()};
+  while (!worklist.empty()) {
+    auto *block = worklist.pop_back_val();
+    if (!initialBlocks.insert(block).second)
+      continue;
+    if (block->getTerminator() == wait.getOperation())
+      continue;
+    for (auto *successor : block->getSuccessors())
+      worklist.push_back(successor);
+  }
+  for (auto *block : initialBlocks) {
+    auto probeOps = block->getOps<ProbeOp>();
+    if (probeOps.empty())
+      continue;
+    LLVM_DEBUG(llvm::dbgs()
+               << "Skipping " << process.getLoc() << ": probes before wait "
+               << *probeOps.begin() << "\n");
     return false;
   }
 

@@ -1362,3 +1362,62 @@ hw.module @FalseInitialDrives(in %clock: i1, in %d: i42, in %c: i1) {
   // Don't initialize from drive at different time
   llhd.drv %3, %c123_i42 after %0 : i42
 }
+
+// Probes after the wait sample their signal at the clock edge, just like the
+// register. This holds for probes guarded by control flow as well.
+// CHECK-LABEL: @ProbeAfterWait(
+hw.module @ProbeAfterWait(in %clock: i1, in %en: i1, in %x: i42) {
+  %c0_i42 = hw.constant 0 : i42
+  %0 = llhd.constant_time <0ns, 1d, 0e>
+  %d = llhd.sig %c0_i42 : <i42>
+  llhd.drv %d, %x after %0 : i42
+  // CHECK-NOT: llhd.process
+  // CHECK: [[COMB:%.+]]:2 = llhd.combinational
+  // CHECK: llhd.prb %d
+  // CHECK: [[CLK:%.+]] = seq.to_clock %clock
+  // CHECK: [[MUX:%.+]] = comb.mux bin [[COMB]]#1, [[COMB]]#0, [[REG:%.+]] :
+  // CHECK: [[REG]] = seq.firreg [[MUX]] clock [[CLK]] : i42
+  %1, %2 = llhd.process -> i42, i1 {
+    %true = hw.constant true
+    %false = hw.constant false
+    cf.br ^bb1(%c0_i42, %false : i42, i1)
+  ^bb1(%3: i42, %4: i1):
+    llhd.wait yield (%3, %4 : i42, i1), (%clock : i1), ^bb2(%clock : i1)
+  ^bb2(%5: i1):
+    %6 = comb.xor bin %5, %true : i1
+    %7 = comb.and bin %6, %clock : i1  // posedge clock
+    %8 = comb.and bin %7, %en : i1
+    cf.cond_br %8, ^bb3, ^bb1(%c0_i42, %false : i42, i1)
+  ^bb3:
+    %9 = llhd.prb %d : i42
+    cf.br ^bb1(%9, %true : i42, i1)
+  }
+  %3 = llhd.sig : <i42>
+  llhd.drv %3, %1 after %0 if %2 : i42
+}
+
+// Probes before the wait only sample their signal once at the start of the
+// simulation. A register would sample the signal at every clock edge instead.
+// CHECK-LABEL: @SkipProbeBeforeWait(
+hw.module @SkipProbeBeforeWait(in %clock: i1, in %x: i42) {
+  %c0_i42 = hw.constant 0 : i42
+  %0 = llhd.constant_time <0ns, 1d, 0e>
+  %d = llhd.sig %c0_i42 : <i42>
+  llhd.drv %d, %x after %0 : i42
+  // CHECK-NOT: seq.firreg
+  // CHECK: llhd.process
+  %1, %2 = llhd.process -> i42, i1 {
+    %true = hw.constant true
+    %false = hw.constant false
+    %3 = llhd.prb %d : i42
+    cf.br ^bb1(%c0_i42, %false : i42, i1)
+  ^bb1(%4: i42, %5: i1):
+    llhd.wait yield (%4, %5 : i42, i1), (%clock : i1), ^bb2(%clock : i1)
+  ^bb2(%6: i1):
+    %7 = comb.xor bin %6, %true : i1
+    %8 = comb.and bin %7, %clock : i1  // posedge clock
+    cf.cond_br %8, ^bb1(%3, %true : i42, i1), ^bb1(%c0_i42, %false : i42, i1)
+  }
+  %4 = llhd.sig : <i42>
+  llhd.drv %4, %1 after %0 if %2 : i42
+}
