@@ -1323,8 +1323,9 @@ hw.module private @Timeout_10314() {
   hw.output
 }
 
-// Probe an uninitialized signal after its declaration, even when it is only
-// declared on one branch. Preserve the bits not overwritten by a partial drive.
+// Use zero as the starting value of an uninitialized local signal, even when it
+// is only declared on one branch. Preserve the bits not overwritten by a
+// partial drive. The local signal is removed entirely.
 // CHECK-LABEL: @UninitializedPartialDrive
 hw.module @UninitializedPartialDrive() {
   %zero = hw.constant 0 : i12
@@ -1334,9 +1335,8 @@ hw.module @UninitializedPartialDrive() {
     cf.cond_br %false, ^bb1, ^bb2
   ^bb1:
     // CHECK: ^bb1:
-    // CHECK-NEXT: %[[SIG:.+]] = llhd.sig : <i32>
+    // CHECK-NEXT: [[INIT:%.+]] = hw.constant 0 : i32
     %sig = llhd.sig : <i32>
-    // CHECK-NEXT: [[INIT:%.+]] = llhd.prb %[[SIG]] : i32
     // CHECK-NEXT: [[HIGH:%.+]] = comb.extract [[INIT]] from 12 : (i32) -> i20
     // CHECK-NEXT: [[VALUE:%.+]] = comb.concat [[HIGH]], %c0_i12 : i20, i12
     %part = llhd.sig.extract %sig from %offset : <i32> -> <i12>
@@ -1344,7 +1344,7 @@ hw.module @UninitializedPartialDrive() {
     // CHECK-NEXT: call @use_i32([[VALUE]])
     %value = llhd.prb %sig : i32
     func.call @use_i32(%value) : (i32) -> ()
-    // CHECK-NEXT: llhd.assign %[[SIG]], [[VALUE]]
+    // CHECK-NEXT: cf.br ^bb2
     cf.br ^bb2
   ^bb2:
     llhd.halt
@@ -1390,7 +1390,7 @@ hw.module @UninitializedWrittenBeforePartialDrive(in %u: !hw.array<4xi42>, in %v
 }
 
 // Reentering the declaration starts a new signal lifetime. Each iteration
-// must probe the new signal for the value forwarded when the drive is disabled.
+// starts with zero as the value forwarded when the drive is disabled.
 // CHECK-LABEL: @UninitializedConditionalDriveInLoop
 hw.module @UninitializedConditionalDriveInLoop(in %v: i42, in %q: i1, in %again: i1) {
   // CHECK: llhd.process
@@ -1399,9 +1399,8 @@ hw.module @UninitializedConditionalDriveInLoop(in %v: i42, in %q: i1, in %again:
     cf.br ^bb1
   ^bb1:
     // CHECK-NEXT: ^bb1:
-    // CHECK-NEXT: %sig = llhd.sig : <i42>
+    // CHECK-NEXT: [[INIT:%.+]] = hw.constant 0 : i42
     %sig = llhd.sig : <i42>
-    // CHECK-NEXT: [[INIT:%.+]] = llhd.prb %sig : i42
     // CHECK-NEXT: [[VALUE:%.+]] = comb.mux %q, %v, [[INIT]] : i42
     llhd.assign %sig, %v if %q : i42
     %value = llhd.prb %sig : i42
@@ -1414,23 +1413,23 @@ hw.module @UninitializedConditionalDriveInLoop(in %v: i42, in %q: i1, in %again:
 }
 
 // A delayed partial drive updates the pending value, while probes still see
-// the starting value. Both values need the read after the local declaration.
+// the starting value, which is zero for an uninitialized local signal. The
+// local signal and its pending drive are unobservable and removed.
 // CHECK-LABEL: @UninitializedDelayedPartialDrive
 hw.module @UninitializedDelayedPartialDrive(in %v: i42, in %i: i2) {
   %time = llhd.constant_time <0ns, 1d>
   // CHECK: llhd.process
   llhd.process {
-    // CHECK-NEXT: %sig = llhd.sig : <!hw.array<4xi42>>
+    // CHECK-NEXT: [[ZERO:%.+]] = hw.constant 0 : i168
+    // CHECK-NEXT: [[INIT:%.+]] = hw.bitcast [[ZERO]] : (i168) -> !hw.array<4xi42>
     %sig = llhd.sig : <!hw.array<4xi42>>
-    // CHECK-NEXT: [[INIT:%.+]] = llhd.prb %sig
     %part = llhd.sig.array_get %sig[%i] : <!hw.array<4xi42>>
-    // CHECK-NEXT: [[VALUE:%.+]] = hw.array_inject [[INIT]][%i], %v
     llhd.drv %part, %v after %time : i42
     %value = llhd.prb %sig : !hw.array<4xi42>
     // CHECK-NEXT: call @use_array_i42([[INIT]])
     func.call @use_array_i42(%value) : (!hw.array<4xi42>) -> ()
-    // CHECK-NEXT: [[TIME:%.+]] = llhd.constant_time <0ns, 1d>
-    // CHECK-NEXT: llhd.drv %sig, [[VALUE]] after [[TIME]]
+    // CHECK-NOT: llhd.sig
+    // CHECK-NOT: llhd.drv
     // CHECK-NEXT: llhd.halt
     llhd.halt
   }
@@ -1454,6 +1453,32 @@ hw.module @InitializedDelayedPartialDrive(in %u: !hw.array<4xi42>, in %v: i42, i
      // CHECK-NEXT: llhd.halt
     llhd.halt
   }
+}
+
+// An uninitialized local signal that is never driven only provides its
+// undefined starting value, which becomes zero. No probe is left behind, so
+// the combinational region no longer has side effects.
+// CHECK-LABEL: @UninitializedNeverDriven
+hw.module @UninitializedNeverDriven(in %s: i1, in %v: i4, out o: i8) {
+  %c0_i8 = hw.constant 0 : i8
+  // CHECK: llhd.combinational
+  %0 = llhd.combinational -> i8 {
+    cf.cond_br %s, ^bb1, ^bb2(%c0_i8 : i8)
+  ^bb1:
+    // CHECK: ^bb1:
+    // CHECK-NEXT: [[ZERO:%.+]] = hw.constant 0 : i4
+    // CHECK-NEXT: [[VALUE:%.+]] = comb.concat %v, [[ZERO]] : i4, i4
+    // CHECK-NOT: llhd.sig
+    // CHECK-NOT: llhd.prb
+    %r = llhd.sig : <i4>
+    %1 = llhd.prb %r : i4
+    %2 = comb.concat %v, %1 : i4, i4
+    // CHECK: cf.br ^bb2([[VALUE]] : i8)
+    cf.br ^bb2(%2 : i8)
+  ^bb2(%3: i8):
+    llhd.yield %3 : i8
+  }
+  hw.output %0 : i8
 }
 
 // Projection chains of slots, including any constants defined inside the
