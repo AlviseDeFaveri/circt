@@ -1784,11 +1784,23 @@ void Promoter::insertProbes(SlotNode *node) {
   if (!node->def && node->valueAfter->needed) {
     OpBuilder builder(op);
     builder.setInsertionPointAfter(op);
-    auto value = ProbeOp::create(builder, currentSlot.getLoc(), currentSlot);
+    Value value;
+    auto signalOp = dyn_cast<SignalOp>(op);
+    if (signalOp && !signalOp.getInit()) {
+      // A signal declared inside the region without an initializer starts
+      // out with an undefined value every time its declaration executes. Any
+      // value is a valid refinement, so use zero instead of a probe. This
+      // avoids leaving a side-effecting probe behind in the region.
+      value = createZeroValue(builder, currentSlot.getLoc(),
+                              signalOp.getType().getNestedType());
+      LLVM_DEBUG(llvm::dbgs()
+                 << "- Using zero as initial value of " << currentSlot << "\n");
+    } else {
+      value = ProbeOp::create(builder, currentSlot.getLoc(), currentSlot);
+      LLVM_DEBUG(llvm::dbgs() << "- Inserting probe for " << currentSlot
+                              << " after " << *op << "\n");
+    }
     node->def = lattice->createDef(value, DriveCondition::never());
-
-    LLVM_DEBUG(llvm::dbgs() << "- Inserting probe for " << currentSlot
-                            << " after " << *op << "\n");
   }
 
   // The probe stays where the projection was, so moving the projection out
