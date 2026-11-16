@@ -539,6 +539,8 @@ void circt::populateLlhdToCorePipeline(
   auto &modulePM = pm.nest<hw::HWModuleOp>();
   // See https://github.com/llvm/circt/issues/8804.
   if (options.sroa) {
+    modulePM.addPass(llhd::createHoistProjectionsPass());
+    modulePM.addPass(mlir::createCSEPass());
     modulePM.addPass(mlir::createSROA());
   }
   modulePM.addPass(llhd::createMem2RegPass());
