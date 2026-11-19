@@ -346,3 +346,24 @@ hw.module private @struct_explode(in %s: !hw.struct<a: i1, b: i2, c: i3>, out a:
   %a, %b, %c = hw.struct_explode %s : !hw.struct<a: i1, b: i2, c: i3>
   hw.output %a, %b, %c : i1, i2, i3
 }
+
+// CHECK-LABEL: @registers(
+hw.module private @registers(in %clk: !seq.clock, in %rst: i1, in %s: !hw.struct<a: i1, b: i2>, in %a: !hw.array<4xi8>, out o0: i2, out o1: i8, out o2: i8) {
+  // CHECK-DAG: %[[S:.+]] = hw.bitcast %s : (!hw.struct<a: i1, b: i2>) -> i3
+  // CHECK-DAG: %[[A:.+]] = hw.bitcast %a : (!hw.array<4xi8>) -> i32
+  // CHECK-DAG: %[[RV:.+]] = hw.constant 0 : i3
+  // CHECK: %r0 = seq.firreg %[[S]] clock %clk reset async %rst, %[[RV]] : i3
+  // CHECK: %r1 = seq.firreg %[[A]] clock %clk {sv.attr = "keep"} : i32
+  // CHECK: %r2 = seq.compreg %[[A]], %clk : i32
+  // CHECK-NOT: !hw.struct
+  // CHECK-NOT: !hw.array
+  %c0 = hw.aggregate_constant [0 : i1, 0 : i2] : !hw.struct<a: i1, b: i2>
+  %r0 = seq.firreg %s clock %clk reset async %rst, %c0 : !hw.struct<a: i1, b: i2>
+  %r1 = seq.firreg %a clock %clk {sv.attr = "keep"} : !hw.array<4xi8>
+  %r2 = seq.compreg %a, %clk : !hw.array<4xi8>
+  %b = hw.struct_extract %r0["b"] : !hw.struct<a: i1, b: i2>
+  %c0_i2 = hw.constant 0 : i2
+  %e1 = hw.array_get %r1[%c0_i2] : !hw.array<4xi8>, i2
+  %e2 = hw.array_get %r2[%c0_i2] : !hw.array<4xi8>, i2
+  hw.output %b, %e1, %e2 : i2, i8, i8
+}

@@ -114,7 +114,8 @@ def HWAggregateToComb : Pass<"hw-aggregate-to-comb", "hw::HWModuleOp"> {
   let description = [{
     This pass lowers aggregate *operations* to comb operations within modules.
     Note that this pass does not lower ports. Ports lowering is handled
-    by FlattenIO.
+    by FlattenIO. Aggregate-typed registers (`seq.firreg`, and `seq.compreg`
+    without an initial value) are converted to integer-typed registers.
 
     This pass will change the behavior of out-of-bounds access of arrays,
     specifically the last element of the array is used as a value for
