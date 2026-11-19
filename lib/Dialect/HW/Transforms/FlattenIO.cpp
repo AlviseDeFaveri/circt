@@ -22,29 +22,101 @@ namespace hw {
 using namespace mlir;
 using namespace circt;
 
-static bool isStructType(Type type) {
-  return isa<hw::StructType>(hw::getCanonicalType(type));
-}
-
-static hw::StructType getStructType(Type type) {
-  return dyn_cast<hw::StructType>(hw::getCanonicalType(type));
-}
-
-// Legal if no in- or output type is a struct.
-static bool isLegalModLikeOp(hw::HWModuleLike moduleLikeOp) {
-  return llvm::none_of(moduleLikeOp.getHWModuleType().getPortTypes(),
-                       isStructType);
-}
-
-static llvm::SmallVector<Type> getInnerTypes(hw::StructType t) {
-  llvm::SmallVector<Type> inner;
-  t.getInnerTypes(inner);
-  for (auto [index, innerType] : llvm::enumerate(inner))
-    inner[index] = hw::getCanonicalType(innerType);
-  return inner;
-}
-
 namespace {
+
+/// Describes which aggregate types are flattened, and how to split and rebuild
+/// values of those types. Structs are always flattened; arrays only if
+/// `flattenArrays` is set. Array elements are flattened in index order and
+/// named by their index.
+struct AggregateFlattener {
+  bool flattenArrays = false;
+
+  /// Return the canonical aggregate type if `type` should be flattened, or a
+  /// null type otherwise.
+  Type getAggregate(Type type) const {
+    auto canonical = hw::getCanonicalType(type);
+    if (isa<hw::StructType>(canonical))
+      return canonical;
+    if (auto arrayType = dyn_cast<hw::ArrayType>(canonical))
+      if (flattenArrays && arrayType.getNumElements() > 0)
+        return canonical;
+    return {};
+  }
+
+  bool isAggregate(Type type) const { return bool(getAggregate(type)); }
+
+  /// Return the element types of the aggregate `type`, optionally
+  /// canonicalized.
+  SmallVector<Type> getFieldTypes(Type type, bool canonicalize = false) const {
+    SmallVector<Type> types;
+    auto maybeCanonical = [&](Type t) {
+      return canonicalize ? hw::getCanonicalType(t) : t;
+    };
+    if (auto structType = dyn_cast<hw::StructType>(getAggregate(type))) {
+      for (auto field : structType.getElements())
+        types.push_back(maybeCanonical(field.type));
+    } else if (auto arrayType = dyn_cast<hw::ArrayType>(getAggregate(type))) {
+      types.append(arrayType.getNumElements(),
+                   maybeCanonical(arrayType.getElementType()));
+    }
+    return types;
+  }
+
+  /// Return the name suffixes of the elements of the aggregate `type`.
+  SmallVector<std::string> getFieldNames(Type type) const {
+    SmallVector<std::string> names;
+    if (auto structType = dyn_cast<hw::StructType>(getAggregate(type))) {
+      for (auto field : structType.getElements())
+        names.push_back(field.name.str());
+    } else if (auto arrayType = dyn_cast<hw::ArrayType>(getAggregate(type))) {
+      for (size_t i = 0, e = arrayType.getNumElements(); i < e; ++i)
+        names.push_back(std::to_string(i));
+    }
+    return names;
+  }
+
+  size_t getNumFields(Type type) const { return getFieldTypes(type).size(); }
+
+  /// Split an aggregate value into its elements.
+  SmallVector<Value> explode(OpBuilder &builder, Location loc,
+                             Value value) const {
+    auto type = getAggregate(value.getType());
+    if (auto structType = dyn_cast<hw::StructType>(type)) {
+      auto explodeOp = hw::StructExplodeOp::create(
+          builder, loc, getFieldTypes(structType, /*canonicalize=*/true),
+          value);
+      return SmallVector<Value>(explodeOp.getResults());
+    }
+    auto arrayType = cast<hw::ArrayType>(type);
+    size_t numElements = arrayType.getNumElements();
+    unsigned indexWidth = std::max(1u, llvm::Log2_64_Ceil(numElements));
+    auto elementType = hw::getCanonicalType(arrayType.getElementType());
+    SmallVector<Value> elements;
+    for (size_t i = 0; i < numElements; ++i) {
+      auto index = hw::ConstantOp::create(
+          builder, loc, builder.getIntegerType(indexWidth), i);
+      elements.push_back(
+          hw::ArrayGetOp::create(builder, loc, elementType, value, index));
+    }
+    return elements;
+  }
+
+  /// Rebuild a value of aggregate `type` from its elements.
+  Value implode(OpBuilder &builder, Location loc, Type type,
+                ValueRange elements) const {
+    if (isa<hw::StructType>(getAggregate(type)))
+      return hw::StructCreateOp::create(builder, loc, type, elements);
+    // `hw.array_create` lists the highest index first.
+    SmallVector<Value> reversed(llvm::reverse(elements));
+    return hw::ArrayCreateOp::create(builder, loc, type, reversed);
+  }
+
+  /// Legal if no in- or output type is an aggregate to be flattened.
+  bool isLegalModLikeOp(hw::HWModuleLike moduleLikeOp) const {
+    return llvm::none_of(moduleLikeOp.getHWModuleType().getPortTypes(),
+                         [&](Type type) { return isAggregate(type); });
+  }
+};
 
 /// Flatten the given value ranges into a single vector of values.
 static SmallVector<Value> flattenValues(ArrayRef<ValueRange> values) {
@@ -57,8 +129,10 @@ static SmallVector<Value> flattenValues(ArrayRef<ValueRange> values) {
 // Replaces an output op with a new output with flattened (exploded) structs.
 struct OutputOpConversion : public OpConversionPattern<hw::OutputOp> {
   OutputOpConversion(TypeConverter &typeConverter, MLIRContext *context,
-                     DenseSet<Operation *> *opVisited)
-      : OpConversionPattern(typeConverter, context), opVisited(opVisited) {}
+                     DenseSet<Operation *> *opVisited,
+                     const AggregateFlattener &flattener)
+      : OpConversionPattern(typeConverter, context), opVisited(opVisited),
+        flattener(flattener) {}
 
   LogicalResult
   matchAndRewrite(hw::OutputOp op, OpAdaptor adaptor,
@@ -67,12 +141,10 @@ struct OutputOpConversion : public OpConversionPattern<hw::OutputOp> {
 
     // Flatten the operands.
     for (auto operand : adaptor.getOperands()) {
-      if (auto structType = getStructType(operand.getType())) {
-        auto explodedStruct = hw::StructExplodeOp::create(
-            rewriter, op.getLoc(), getInnerTypes(structType), operand);
-        llvm::copy(explodedStruct.getResults(),
-                   std::back_inserter(convOperands));
-      } else {
+      if (flattener.isAggregate(operand.getType()))
+        llvm::append_range(convOperands,
+                           flattener.explode(rewriter, op.getLoc(), operand));
+      else {
         convOperands.push_back(operand);
       }
     }
@@ -90,12 +162,10 @@ struct OutputOpConversion : public OpConversionPattern<hw::OutputOp> {
 
     // Flatten the operands.
     for (auto operand : flattenValues(adaptor.getOperands())) {
-      if (auto structType = getStructType(operand.getType())) {
-        auto explodedStruct = hw::StructExplodeOp::create(
-            rewriter, op.getLoc(), getInnerTypes(structType), operand);
-        llvm::copy(explodedStruct.getResults(),
-                   std::back_inserter(convOperands));
-      } else {
+      if (flattener.isAggregate(operand.getType()))
+        llvm::append_range(convOperands,
+                           flattener.explode(rewriter, op.getLoc(), operand));
+      else {
         convOperands.push_back(operand);
       }
     }
@@ -106,14 +176,16 @@ struct OutputOpConversion : public OpConversionPattern<hw::OutputOp> {
     return success();
   }
   DenseSet<Operation *> *opVisited;
+  const AggregateFlattener &flattener;
 };
 
 struct InstanceOpConversion : public OpConversionPattern<hw::InstanceOp> {
   InstanceOpConversion(TypeConverter &typeConverter, MLIRContext *context,
                        DenseSet<hw::InstanceOp> *convertedOps,
-                       const StringSet<> *externModules)
+                       const StringSet<> *externModules,
+                       const AggregateFlattener &flattener)
       : OpConversionPattern(typeConverter, context), convertedOps(convertedOps),
-        externModules(externModules) {}
+        externModules(externModules), flattener(flattener) {}
 
   LogicalResult
   matchAndRewrite(hw::InstanceOp op, OneToNOpAdaptor adaptor,
@@ -128,12 +200,10 @@ struct InstanceOpConversion : public OpConversionPattern<hw::InstanceOp> {
     // Flatten the operands.
     llvm::SmallVector<Value> convOperands;
     for (auto operand : flattenValues(adaptor.getOperands())) {
-      if (auto structType = getStructType(operand.getType())) {
-        auto explodedStruct = hw::StructExplodeOp::create(
-            rewriter, loc, getInnerTypes(structType), operand);
-        llvm::copy(explodedStruct.getResults(),
-                   std::back_inserter(convOperands));
-      } else {
+      if (flattener.isAggregate(operand.getType()))
+        llvm::append_range(convOperands,
+                           flattener.explode(rewriter, loc, operand));
+      else {
         convOperands.push_back(operand);
       }
     }
@@ -141,9 +211,9 @@ struct InstanceOpConversion : public OpConversionPattern<hw::InstanceOp> {
     // Get the new module return type.
     llvm::SmallVector<Type> newResultTypes;
     for (auto oldResultType : op.getResultTypes()) {
-      if (auto structType = getStructType(oldResultType))
-        for (auto t : structType.getElements())
-          newResultTypes.push_back(t.type);
+      if (flattener.isAggregate(oldResultType))
+        llvm::append_range(newResultTypes,
+                           flattener.getFieldTypes(oldResultType));
       else
         newResultTypes.push_back(oldResultType);
     }
@@ -162,12 +232,11 @@ struct InstanceOpConversion : public OpConversionPattern<hw::InstanceOp> {
     for (size_t resIndex = 0; resIndex < newInstance.getNumResults();
          ++resIndex) {
       Type oldResultType = op.getResultTypes()[oldResultCntr];
-      if (auto structType = getStructType(oldResultType)) {
-        size_t nElements = structType.getElements().size();
-        auto implodedStruct = hw::StructCreateOp::create(
-            rewriter, loc, structType,
-            newInstance.getResults().slice(resIndex, nElements));
-        convResults.push_back(implodedStruct.getResult());
+      if (auto aggType = flattener.getAggregate(oldResultType)) {
+        size_t nElements = flattener.getNumFields(aggType);
+        convResults.push_back(flattener.implode(
+            rewriter, loc, aggType,
+            newInstance.getResults().slice(resIndex, nElements)));
         resIndex += nElements - 1;
       } else
         convResults.push_back(newInstance.getResult(resIndex));
@@ -181,13 +250,15 @@ struct InstanceOpConversion : public OpConversionPattern<hw::InstanceOp> {
 
   DenseSet<hw::InstanceOp> *convertedOps;
   const StringSet<> *externModules;
+  const AggregateFlattener &flattener;
 };
 
 using IOTypes = std::pair<TypeRange, TypeRange>;
 
 struct IOInfo {
-  // A mapping between an arg/res index and the struct type of the given field.
-  DenseMap<unsigned, hw::StructType> argStructs, resStructs;
+  // A mapping between an arg/res index and the aggregate type of the given
+  // field.
+  DenseMap<unsigned, Type> argStructs, resStructs;
 
   // Records of the original arg/res types.
   SmallVector<Type> argTypes, resTypes;
@@ -195,38 +266,30 @@ struct IOInfo {
 
 class FlattenIOTypeConverter : public TypeConverter {
 public:
-  FlattenIOTypeConverter() {
-    addConversion([](Type type, SmallVectorImpl<Type> &results) {
-      auto structType = getStructType(type);
-      if (!structType)
+  FlattenIOTypeConverter(const AggregateFlattener &flattener) {
+    addConversion([&flattener](Type type, SmallVectorImpl<Type> &results) {
+      if (!flattener.isAggregate(type))
         results.push_back(type);
-      else {
-        for (auto field : structType.getElements())
-          results.push_back(field.type);
-      }
+      else
+        llvm::append_range(results, flattener.getFieldTypes(type));
       return success();
     });
 
     // Materialize !hw.struct<a,b,...> to a, b, ... via. hw.explode. This
     // situation may occur in case of hw.extern_module's with struct outputs.
-    addTargetMaterialization([](OpBuilder &builder, TypeRange resultTypes,
-                                ValueRange inputs, Location loc) {
-      if (inputs.size() != 1 && !isStructType(inputs[0].getType()))
-        return ValueRange();
-
-      auto explodeOp = hw::StructExplodeOp::create(builder, loc, inputs[0]);
-      return ValueRange(explodeOp.getResults());
-    });
-    addTargetMaterialization([](OpBuilder &builder, hw::StructType type,
-                                ValueRange inputs, Location loc) {
-      auto result = hw::StructCreateOp::create(builder, loc, type, inputs);
-      return result.getResult();
-    });
-
-    addTargetMaterialization([](OpBuilder &builder, hw::TypeAliasType type,
-                                ValueRange inputs, Location loc) {
-      auto result = hw::StructCreateOp::create(builder, loc, type, inputs);
-      return result.getResult();
+    addTargetMaterialization(
+        [&flattener](OpBuilder &builder, TypeRange resultTypes,
+                     ValueRange inputs, Location loc) -> SmallVector<Value> {
+          if (inputs.size() != 1 || !flattener.isAggregate(inputs[0].getType()))
+            return {};
+          return flattener.explode(builder, loc, inputs[0]);
+        });
+    addTargetMaterialization([&flattener](OpBuilder &builder, Type type,
+                                          ValueRange inputs,
+                                          Location loc) -> Value {
+      if (!flattener.isAggregate(type))
+        return {};
+      return flattener.implode(builder, loc, type, inputs);
     });
 
     // In the presence of hw.extern_module which takes struct arguments, we may
@@ -235,10 +298,12 @@ public:
     // these structs to the hw.instance).
     // These struct explodes needs to be converted back to the original struct,
     // which persist beyond the conversion.
-    addSourceMaterialization([](OpBuilder &builder, hw::StructType type,
-                                ValueRange inputs, Location loc) {
-      auto result = hw::StructCreateOp::create(builder, loc, type, inputs);
-      return result.getResult();
+    addSourceMaterialization([&flattener](OpBuilder &builder, Type type,
+                                          ValueRange inputs,
+                                          Location loc) -> Value {
+      if (!flattener.isAggregate(type))
+        return {};
+      return flattener.implode(builder, loc, type, inputs);
     });
   }
 };
@@ -249,7 +314,8 @@ template <typename... TOp>
 static void addSignatureConversion(DenseMap<Operation *, IOInfo> &ioMap,
                                    ConversionTarget &target,
                                    RewritePatternSet &patterns,
-                                   FlattenIOTypeConverter &typeConverter) {
+                                   FlattenIOTypeConverter &typeConverter,
+                                   const AggregateFlattener &flattener) {
   (hw::populateHWModuleLikeTypeConversionPattern(TOp::getOperationName(),
                                                  patterns, typeConverter),
    ...);
@@ -265,7 +331,7 @@ static void addSignatureConversion(DenseMap<Operation *, IOInfo> &ioMap,
   // processed during signature conversion, which then allows us to use the
   // signature conversion in a recursive manner.
   target.addDynamicallyLegalOp<TOp...>([&](hw::HWModuleLike moduleLikeOp) {
-    if (isLegalModLikeOp(moduleLikeOp))
+    if (flattener.isLegalModLikeOp(moduleLikeOp))
       return true;
 
     // This op is involved in conversion. Check if the signature has changed.
@@ -296,9 +362,10 @@ static void addSignatureConversion(DenseMap<Operation *, IOInfo> &ioMap,
 }
 
 template <typename T>
-static bool hasUnconvertedOps(mlir::ModuleOp module) {
+static bool hasUnconvertedOps(mlir::ModuleOp module,
+                              const AggregateFlattener &flattener) {
   return llvm::any_of(module.getBody()->getOps<T>(),
-                      [](T op) { return !isLegalModLikeOp(op); });
+                      [&](T op) { return !flattener.isLegalModLikeOp(op); });
 }
 
 template <typename T>
@@ -312,8 +379,8 @@ static DenseMap<Operation *, IOTypes> populateIOMap(mlir::ModuleOp module) {
 template <typename ModTy, typename T>
 static llvm::SmallVector<Attribute>
 updateNameAttribute(ModTy op, StringRef attrName,
-                    DenseMap<unsigned, hw::StructType> &structMap, T oldNames,
-                    char joinChar) {
+                    DenseMap<unsigned, Type> &structMap, T oldNames,
+                    char joinChar, const AggregateFlattener &flattener) {
   llvm::SmallVector<Attribute> newNames;
   for (auto [i, oldName] : llvm::enumerate(oldNames)) {
     // Was this arg/res index a struct?
@@ -326,17 +393,17 @@ updateNameAttribute(ModTy op, StringRef attrName,
 
     // Yes - create new names from the struct fields and the old name at the
     // index.
-    auto structType = it->second;
-    for (auto field : structType.getElements())
-      newNames.push_back(StringAttr::get(
-          op->getContext(), oldName + Twine(joinChar) + field.name.str()));
+    for (auto &field : flattener.getFieldNames(it->second))
+      newNames.push_back(
+          StringAttr::get(op->getContext(), oldName + Twine(joinChar) + field));
   }
   return newNames;
 }
 
 template <typename ModTy>
 static void updateModulePortNames(ModTy op, hw::ModuleType oldModType,
-                                  char joinChar) {
+                                  char joinChar,
+                                  const AggregateFlattener &flattener) {
   // Module arg and result port names may not be ordered. So we cannot reuse
   // updateNameAttribute. The arg and result order must be preserved.
   SmallVector<Attribute> newNames;
@@ -344,12 +411,10 @@ static void updateModulePortNames(ModTy op, hw::ModuleType oldModType,
                                        oldModType.getPorts().end());
   for (auto oldPort : oldPorts) {
     auto oldName = oldPort.name;
-    if (auto structType = getStructType(oldPort.type)) {
-      for (auto field : structType.getElements()) {
+    if (flattener.isAggregate(oldPort.type)) {
+      for (auto &field : flattener.getFieldNames(oldPort.type))
         newNames.push_back(StringAttr::get(
-            op->getContext(),
-            oldName.getValue() + Twine(joinChar) + field.name.str()));
-      }
+            op->getContext(), oldName.getValue() + Twine(joinChar) + field));
     } else
       newNames.push_back(oldName);
   }
@@ -357,8 +422,9 @@ static void updateModulePortNames(ModTy op, hw::ModuleType oldModType,
 }
 
 static llvm::SmallVector<Location>
-updateLocAttribute(DenseMap<unsigned, hw::StructType> &structMap,
-                   SmallVectorImpl<Location> &oldLocs) {
+updateLocAttribute(DenseMap<unsigned, Type> &structMap,
+                   SmallVectorImpl<Location> &oldLocs,
+                   const AggregateFlattener &flattener) {
   llvm::SmallVector<Location> newLocs;
   for (auto [i, oldLoc] : llvm::enumerate(oldLocs)) {
     // Was this arg/res index a struct?
@@ -369,9 +435,7 @@ updateLocAttribute(DenseMap<unsigned, hw::StructType> &structMap,
       continue;
     }
 
-    auto structType = it->second;
-    for (size_t i = 0, e = structType.getElements().size(); i < e; ++i)
-      newLocs.push_back(oldLoc);
+    newLocs.append(flattener.getNumFields(it->second), oldLoc);
   }
   return newLocs;
 }
@@ -379,9 +443,8 @@ updateLocAttribute(DenseMap<unsigned, hw::StructType> &structMap,
 /// The conversion framework seems to throw away block argument locations.  We
 /// use this function to copy the location from the original argument to the
 /// set of flattened arguments.
-static void
-updateBlockLocations(hw::HWModuleLike op,
-                     DenseMap<unsigned, hw::StructType> &structMap) {
+static void updateBlockLocations(hw::HWModuleLike op,
+                                 DenseMap<unsigned, Type> &structMap) {
   auto locs = op.getInputLocs();
   if (locs.empty() || op.getModuleBody().empty())
     return;
@@ -389,25 +452,27 @@ updateBlockLocations(hw::HWModuleLike op,
     arg.setLoc(loc);
 }
 
-static void setIOInfo(hw::HWModuleLike op, IOInfo &ioInfo) {
+static void setIOInfo(hw::HWModuleLike op, IOInfo &ioInfo,
+                      const AggregateFlattener &flattener) {
   ioInfo.argTypes = op.getInputTypes();
   ioInfo.resTypes = op.getOutputTypes();
   for (auto [i, arg] : llvm::enumerate(ioInfo.argTypes)) {
-    if (auto structType = getStructType(arg))
-      ioInfo.argStructs[i] = structType;
+    if (auto aggType = flattener.getAggregate(arg))
+      ioInfo.argStructs[i] = aggType;
   }
   for (auto [i, res] : llvm::enumerate(ioInfo.resTypes)) {
-    if (auto structType = getStructType(res))
-      ioInfo.resStructs[i] = structType;
+    if (auto aggType = flattener.getAggregate(res))
+      ioInfo.resStructs[i] = aggType;
   }
 }
 
 template <typename T>
-static DenseMap<Operation *, IOInfo> populateIOInfoMap(mlir::ModuleOp module) {
+static DenseMap<Operation *, IOInfo>
+populateIOInfoMap(mlir::ModuleOp module, const AggregateFlattener &flattener) {
   DenseMap<Operation *, IOInfo> ioInfoMap;
   for (auto op : module.getOps<T>()) {
     IOInfo ioInfo;
-    setIOInfo(op, ioInfo);
+    setIOInfo(op, ioInfo, flattener);
     ioInfoMap[op] = ioInfo;
   }
   return ioInfoMap;
@@ -415,22 +480,22 @@ static DenseMap<Operation *, IOInfo> populateIOInfoMap(mlir::ModuleOp module) {
 
 template <typename T>
 static LogicalResult flattenOpsOfType(ModuleOp module, bool recursive,
-                                      StringSet<> &externModules,
-                                      char joinChar) {
+                                      StringSet<> &externModules, char joinChar,
+                                      const AggregateFlattener &flattener) {
   auto *ctx = module.getContext();
-  FlattenIOTypeConverter typeConverter;
+  FlattenIOTypeConverter typeConverter(flattener);
 
   // Recursively (in case of nested structs) lower the module. We do this one
   // conversion at a time to allow for updating the arg/res names of the
   // module in between flattening each level of structs.
-  while (hasUnconvertedOps<T>(module)) {
+  while (hasUnconvertedOps<T>(module, flattener)) {
     ConversionTarget target(*ctx);
     RewritePatternSet patterns(ctx);
     target.addLegalDialect<hw::HWDialect>();
 
     // Record any struct types at the module signature. This will be used
     // post-conversion to update the argument and result names.
-    auto ioInfoMap = populateIOInfoMap<T>(module);
+    auto ioInfoMap = populateIOInfoMap<T>(module, flattener);
 
     // Record the instances that were converted. We keep these around since we
     // need to update their arg/res attribute names after the modules themselves
@@ -441,21 +506,22 @@ static LogicalResult flattenOpsOfType(ModuleOp module, bool recursive,
     // conversion, legality is based on the op having been visited once, due to
     // the possibility of nested structs.
     DenseSet<Operation *> opVisited;
-    patterns.add<OutputOpConversion>(typeConverter, ctx, &opVisited);
+    patterns.add<OutputOpConversion>(typeConverter, ctx, &opVisited, flattener);
 
     patterns.add<InstanceOpConversion>(typeConverter, ctx, &convertedInstances,
-                                       &externModules);
+                                       &externModules, flattener);
     target.addDynamicallyLegalOp<hw::OutputOp>(
         [&](auto op) { return opVisited.contains(op->getParentOp()); });
     target.addDynamicallyLegalOp<hw::InstanceOp>([&](hw::InstanceOp op) {
       auto refName = op.getReferencedModuleName();
       return externModules.contains(refName) ||
              (llvm::none_of(op->getOperands(),
-                            [](auto operand) {
-                              return isStructType(operand.getType());
+                            [&](auto operand) {
+                              return flattener.isAggregate(operand.getType());
                             }) &&
-              llvm::none_of(op->getResultTypes(),
-                            [](auto result) { return isStructType(result); }));
+              llvm::none_of(op->getResultTypes(), [&](auto result) {
+                return flattener.isAggregate(result);
+              }));
     });
 
     DenseMap<Operation *, ArrayAttr> oldArgNames, oldResNames;
@@ -472,7 +538,8 @@ static LogicalResult flattenOpsOfType(ModuleOp module, bool recursive,
     }
 
     // Signature conversion and legalization patterns.
-    addSignatureConversion<T>(ioInfoMap, target, patterns, typeConverter);
+    addSignatureConversion<T>(ioInfoMap, target, patterns, typeConverter,
+                              flattener);
 
     if (failed(applyPartialConversion(module, target, std::move(patterns))))
       return failure();
@@ -480,9 +547,11 @@ static LogicalResult flattenOpsOfType(ModuleOp module, bool recursive,
     // Update the arg/res names of the module.
     for (auto op : module.getOps<T>()) {
       auto ioInfo = ioInfoMap[op];
-      updateModulePortNames(op, oldModTypes[op], joinChar);
-      auto newArgLocs = updateLocAttribute(ioInfo.argStructs, oldArgLocs[op]);
-      auto newResLocs = updateLocAttribute(ioInfo.resStructs, oldResLocs[op]);
+      updateModulePortNames(op, oldModTypes[op], joinChar, flattener);
+      auto newArgLocs =
+          updateLocAttribute(ioInfo.argStructs, oldArgLocs[op], flattener);
+      auto newResLocs =
+          updateLocAttribute(ioInfo.resStructs, oldResLocs[op], flattener);
       newArgLocs.append(newResLocs.begin(), newResLocs.end());
       op.setAllPortLocs(newArgLocs);
       updateBlockLocations(op, ioInfo.argStructs);
@@ -497,7 +566,7 @@ static LogicalResult flattenOpsOfType(ModuleOp module, bool recursive,
       IOInfo ioInfo;
       if (!ioInfoMap.contains(targetModule)) {
         // If an extern module, then not yet processed, populate the maps.
-        setIOInfo(targetModule, ioInfo);
+        setIOInfo(targetModule, ioInfo, flattener);
         ioInfoMap[targetModule] = ioInfo;
         oldArgNames[targetModule] =
             ArrayAttr::get(module.getContext(), targetModule.getInputNames());
@@ -513,13 +582,13 @@ static LogicalResult flattenOpsOfType(ModuleOp module, bool recursive,
           updateNameAttribute(
               instanceOp, "argNames", ioInfo.argStructs,
               oldArgNames[targetModule].template getAsValueRange<StringAttr>(),
-              joinChar)));
+              joinChar, flattener)));
       instanceOp.setOutputNames(ArrayAttr::get(
           instanceOp.getContext(),
           updateNameAttribute(
               instanceOp, "resultNames", ioInfo.resStructs,
               oldResNames[targetModule].template getAsValueRange<StringAttr>(),
-              joinChar)));
+              joinChar, flattener)));
     }
 
     // Break if we've only lowering a single level of structs.
@@ -535,9 +604,10 @@ static LogicalResult flattenOpsOfType(ModuleOp module, bool recursive,
 
 template <typename... TOps>
 static bool flattenIO(ModuleOp module, bool recursive,
-                      StringSet<> &externModules, char joinChar) {
+                      StringSet<> &externModules, char joinChar,
+                      const AggregateFlattener &flattener) {
   return (failed(flattenOpsOfType<TOps>(module, recursive, externModules,
-                                        joinChar)) ||
+                                        joinChar, flattener)) ||
           ...);
 }
 
@@ -549,19 +619,20 @@ class FlattenIOPass : public circt::hw::impl::FlattenIOBase<FlattenIOPass> {
 public:
   void runOnOperation() override {
     ModuleOp module = getOperation();
+    AggregateFlattener flattener{flattenArrays};
     if (!flattenExtern) {
       // Record the extern modules, do not flatten them.
       for (auto m : module.getOps<hw::HWModuleExternOp>())
         externModules.insert(m.getModuleName());
       if (flattenIO<hw::HWModuleOp, hw::HWModuleGeneratedOp>(
-              module, recursive, externModules, joinChar))
+              module, recursive, externModules, joinChar, flattener))
         signalPassFailure();
       return;
     }
 
     if (flattenIO<hw::HWModuleOp, hw::HWModuleExternOp,
                   hw::HWModuleGeneratedOp>(module, recursive, externModules,
-                                           joinChar))
+                                           joinChar, flattener))
       signalPassFailure();
   };
 

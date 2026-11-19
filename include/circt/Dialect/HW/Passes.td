@@ -57,6 +57,8 @@ def FlattenIO : Pass<"hw-flatten-io", "mlir::ModuleOp"> {
       "Flatten the extern modules also.">,
     Option<"joinChar", "join-char", "char", "'.'",
       "Use a custom character to construct the flattened names.">,
+    Option<"flattenArrays", "flatten-arrays", "bool", "false",
+      "Also flatten hw::ArrayType ports; elements are named by their index.">,
   ];
 }
 
