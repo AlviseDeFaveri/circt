@@ -102,8 +102,8 @@ struct LTLImplicationConversion
   matchAndRewrite(ltl::ImplicationOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     // Can only lower boolean implications to comb ops
-    if (!isa<IntegerType>(op.getAntecedent().getType()) ||
-        !isa<IntegerType>(op.getConsequent().getType()))
+    if (!isa<IntegerType>(adaptor.getAntecedent().getType()) ||
+        !isa<IntegerType>(adaptor.getConsequent().getType()))
       return failure();
     /// A -> B = !A || B
     auto loc = op.getLoc();
@@ -122,7 +122,7 @@ struct LTLNotConversion : public OpConversionPattern<ltl::NotOp> {
   matchAndRewrite(ltl::NotOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     // Can only lower boolean nots to comb ops
-    if (!isa<IntegerType>(op.getInput().getType()))
+    if (!isa<IntegerType>(adaptor.getInput().getType()))
       return failure();
     auto loc = op.getLoc();
     auto inverted = comb::createOrFoldNot(rewriter, loc, adaptor.getInput());
@@ -138,8 +138,8 @@ struct LTLAndOpConversion : public OpConversionPattern<ltl::AndOp> {
   matchAndRewrite(ltl::AndOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     // Can only lower boolean ands to comb ops
-    if (!isa<IntegerType>(op->getOperandTypes()[0]) ||
-        !isa<IntegerType>(op->getOperandTypes()[1]))
+    if (!llvm::all_of(adaptor.getOperands().getTypes(),
+                      [](Type type) { return isa<IntegerType>(type); }))
       return failure();
     auto loc = op.getLoc();
     // Explicit twoState value to disambiguate builders
@@ -157,8 +157,8 @@ struct LTLOrOpConversion : public OpConversionPattern<ltl::OrOp> {
   matchAndRewrite(ltl::OrOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     // Can only lower boolean ors to comb ops
-    if (!isa<IntegerType>(op->getOperandTypes()[0]) ||
-        !isa<IntegerType>(op->getOperandTypes()[1]))
+    if (!llvm::all_of(adaptor.getOperands().getTypes(),
+                      [](Type type) { return isa<IntegerType>(type); }))
       return failure();
     auto loc = op.getLoc();
     // Explicit twoState value to disambiguate builders
@@ -176,8 +176,8 @@ struct LTLIntersectOpConversion : public OpConversionPattern<ltl::IntersectOp> {
                   ConversionPatternRewriter &rewriter) const override {
     // Can only lower boolean intersects to comb ops; booleans are
     // instantaneous matches, so intersection is conjunction.
-    if (!isa<IntegerType>(op->getOperandTypes()[0]) ||
-        !isa<IntegerType>(op->getOperandTypes()[1]))
+    if (!llvm::all_of(adaptor.getOperands().getTypes(),
+                      [](Type type) { return isa<IntegerType>(type); }))
       return failure();
     auto loc = op.getLoc();
     // Explicit twoState value to disambiguate builders
@@ -579,24 +579,22 @@ void LowerLTLToCorePass::runOnOperation() {
   target.addIllegalOp<verif::HasBeenResetOp>();
   target.addIllegalOp<ltl::PastOp>();
 
-  auto isLegal = [](Operation *op) {
-    auto hasNonAssertUsers = std::any_of(
-        op->getUsers().begin(), op->getUsers().end(), [](Operation *user) {
-          return !isa<verif::AssertOp, verif::ClockedAssertOp>(user);
-        });
-    auto hasIntegerResultTypes =
-        std::all_of(op->getResultTypes().begin(), op->getResultTypes().end(),
-                    [](Type type) { return isa<IntegerType>(type); });
-    // If there are users other than asserts, we can't map it to comb (unless
-    // the return type is already integer anyway)
-    if (hasNonAssertUsers && !hasIntegerResultTypes)
-      return true;
+  // Populate the set of convertible ops.
+  DenseSet<Operation *> convertible;
+  DenseSet<Operation *> visited;
+  getOperation().walk([&](Operation *op) {
+    if (visited.contains(op))
+      return;
+    // Discover the connected component of bool ops that this op belongs to.
+    DenseSet<Operation *> component;
+    bool canConvert = discoverConnectedComponent(op, component);
+    visited.insert(component.begin(), component.end());
+    // If the discovered component cannot be converted, discard
+    if (canConvert)
+      convertible.insert(component.begin(), component.end());
+  });
+  auto isLegal = [&](Operation *op) { return !convertible.contains(op); };
 
-    // Otherwise illegal if operands are i1
-    return std::any_of(
-        op->getOperands().begin(), op->getOperands().end(),
-        [](Value operand) { return !isa<IntegerType>(operand.getType()); });
-  };
   target.addDynamicallyLegalOp<ltl::ImplicationOp>(isLegal);
   target.addDynamicallyLegalOp<ltl::NotOp>(isLegal);
   target.addDynamicallyLegalOp<ltl::AndOp>(isLegal);
