@@ -10,6 +10,7 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/HW/HWTypes.h"
+#include "circt/Dialect/Seq/SeqOps.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "llvm/ADT/APInt.h"
@@ -509,6 +510,31 @@ struct MuxOpConversion : OpConversionPattern<comb::MuxOp> {
   }
 };
 
+/// Recreate a register (seq.firreg / seq.compreg) with legalized types. All
+/// attributes (name, inner symbol, preset, async flag, ...) are preserved.
+template <typename OpTy>
+struct RegOpConversion : OpConversionPattern<OpTy> {
+  using OpConversionPattern<OpTy>::OpConversionPattern;
+  using OpAdaptor = typename OpConversionPattern<OpTy>::OpAdaptor;
+
+  LogicalResult
+  matchAndRewrite(OpTy op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto resultTy = this->getTypeConverter()->convertType(op.getType());
+    if (!resultTy)
+      return rewriter.notifyMatchFailure(op, "Failed to convert result type.");
+
+    OperationState state(op.getLoc(), op->getName());
+    state.addOperands(adaptor.getOperands());
+    state.addTypes(resultTy);
+    state.addAttributes(op->getAttrs());
+    state.propertiesAttr = op->getPropertiesAsAttribute();
+    Operation *newOp = rewriter.create(state);
+    rewriter.replaceOp(op, newOp->getResults());
+    return success();
+  }
+};
+
 /// A type converter is needed to perform the in-flight materialization of
 /// aggregate types to integer types.
 class AggregateTypeConverter : public TypeConverter {
@@ -558,14 +584,15 @@ public:
 
 static void populateHWAggregateToCombOpConversionPatterns(
     RewritePatternSet &patterns, AggregateTypeConverter &typeConverter) {
-  patterns.add<
-      HWArrayGetOpConversion, HWArrayCreateLikeOpConversion<hw::ArrayCreateOp>,
-      HWArrayCreateLikeOpConversion<hw::ArrayConcatOp>,
-      HWAggregateConstantOpConversion, HWArraySliceOpConversion,
-      HWArrayInjectOpConversion, HWStructCreateOpConversion,
-      HWStructExtractOpConversion, HWStructInjectOpConversion,
-      HWStructExplodeOpConversion, HWUnionCreateOpConversion,
-      HWUnionExtractOpConversion, BitcastOpConversion, MuxOpConversion>(
+  patterns.add<HWArrayGetOpConversion,
+               HWArrayCreateLikeOpConversion<hw::ArrayCreateOp>,
+               HWArrayCreateLikeOpConversion<hw::ArrayConcatOp>,
+               HWAggregateConstantOpConversion, HWArraySliceOpConversion,
+               HWArrayInjectOpConversion, HWStructCreateOpConversion,
+               HWStructExtractOpConversion, HWStructInjectOpConversion,
+               HWStructExplodeOpConversion, HWUnionCreateOpConversion,
+               HWUnionExtractOpConversion, BitcastOpConversion, MuxOpConversion,
+               RegOpConversion<seq::FirRegOp>, RegOpConversion<seq::CompRegOp>>(
       typeConverter, patterns.getContext());
 }
 
@@ -591,8 +618,14 @@ void HWAggregateToCombPass::runOnOperation() {
   AggregateTypeConverter typeConverter;
   populateHWAggregateToCombOpConversionPatterns(patterns, typeConverter);
 
-  target.addDynamicallyLegalOp<comb::MuxOp, hw::BitcastOp>(
+  target.addDynamicallyLegalOp<comb::MuxOp, hw::BitcastOp, seq::FirRegOp>(
       [&typeConverter](auto op) { return typeConverter.isLegal(op); });
+  // Registers with an initial value would also require lowering the
+  // `!seq.immutable` producers (seq.initial); leave those alone.
+  target.addDynamicallyLegalOp<seq::CompRegOp>(
+      [&typeConverter](seq::CompRegOp op) {
+        return op.getInitialValue() || typeConverter.isLegal(op.getOperation());
+      });
 
   if (failed(mlir::applyPartialConversion(getOperation(), target,
                                           std::move(patterns))))
