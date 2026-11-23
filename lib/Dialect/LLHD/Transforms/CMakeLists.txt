@@ -12,6 +12,7 @@ add_circt_dialect_library(CIRCTLLHDTransforms
   ProjectionUtils.cpp
   RemoveControlFlow.cpp
   Sig2Reg.cpp
+  UndrivenToSymbolic.cpp
   UnrollLoops.cpp
   WrapProceduralOps.cpp
 
@@ -23,6 +24,7 @@ add_circt_dialect_library(CIRCTLLHDTransforms
   CIRCTHW
   CIRCTLLHD
   CIRCTSeq
+  CIRCTVerif
   MLIRAnalysis
   MLIRArithDialect
   MLIRControlFlowDialect
