@@ -14,6 +14,7 @@
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/Support/Debug.h"
 
@@ -273,7 +274,20 @@ void CFRemover::run() {
     });
 
     OpBuilder builder(entryBlock->getTerminator());
-    SmallVector<Value> mergedArgs;
+
+    // Collect the values flowing into the block from each predecessor, along
+    // with the branch condition under which control flows along that edge.
+    struct Incoming {
+      Block *pred;
+      SmallVector<Value> args;
+      // The branch condition guarding the edge, or null if unconditional.
+      Value cond;
+      bool invCond = false;
+      // The full decision leading from `domBlock` along this edge. Computed
+      // lazily, since edges carrying the base value don't need it.
+      Condition decision;
+    };
+    SmallVector<Incoming, 4> incomings;
     SmallPtrSet<Block *, 4> seenPreds;
     for (auto *pred : reachablePreds) {
       // A block may be listed multiple times in the predecessors.
@@ -284,34 +298,8 @@ void CFRemover::run() {
       if (!domInfo.isReachableFromEntry(pred))
         continue;
 
-      // Helper function to create a multiplexer between the current
-      // `mergedArgs` and a new set of `args`, where the new args are picked if
-      // `cond` is true and control flows from `domBlock` to `pred`. The
-      // condition may be null, in which case the mux will directly use the
-      // branch decisions that lead from `domBlock` to `pred`.
-      auto mergeArgs = [&](ValueRange args, Condition cond, bool invCond) {
-        if (mergedArgs.empty()) {
-          mergedArgs = args;
-          return;
-        }
-        auto decision = getBranchDecisionsFromDominatorToTarget(
-            builder, domBlock, pred, decisionCache);
-        if (cond) {
-          if (invCond)
-            cond = cond.inverted(builder);
-          decision = decision.andWith(cond, builder);
-        }
-        for (auto [mergedArg, arg] : llvm::zip(mergedArgs, args)) {
-          if (decision.isTrue())
-            mergedArg = arg;
-          else if (decision.isFalse())
-            continue;
-          else
-            mergedArg = builder.createOrFold<comb::MuxOp>(
-                arg.getLoc(), decision.materialize(builder, arg.getLoc()), arg,
-                mergedArg);
-        }
-      };
+      auto &incoming = incomings.emplace_back();
+      incoming.pred = pred;
 
       // Handle the different terminators that we support.
       if (auto condBrOp = dyn_cast<cf::CondBranchOp>(pred->getTerminator())) {
@@ -320,35 +308,197 @@ void CFRemover::run() {
           // collapse the destination operands and then treat this as an
           // unconditional branch to the current block.
           LLVM_DEBUG(llvm::dbgs() << "  - Both from " << condBrOp << "\n");
-          SmallVector<Value> mergedOperands;
-          mergedOperands.reserve(block->getNumArguments());
+          incoming.args.reserve(block->getNumArguments());
           for (auto [trueArg, falseArg] :
                llvm::zip(condBrOp.getTrueDestOperands(),
                          condBrOp.getFalseDestOperands())) {
-            mergedOperands.push_back(builder.createOrFold<comb::MuxOp>(
+            incoming.args.push_back(builder.createOrFold<comb::MuxOp>(
                 trueArg.getLoc(), condBrOp.getCondition(), trueArg, falseArg));
           }
-          mergeArgs(mergedOperands, Value{}, false);
         } else if (condBrOp.getTrueDest() == block) {
           // The branch leads to the current block if the condition is true.
           LLVM_DEBUG(llvm::dbgs() << "  - True from " << condBrOp << "\n");
-          mergeArgs(condBrOp.getTrueDestOperands(), condBrOp.getCondition(),
-                    false);
+          incoming.args = llvm::to_vector(condBrOp.getTrueDestOperands());
+          incoming.cond = condBrOp.getCondition();
         } else {
           // The branch leads to the current block if the condition is false.
           LLVM_DEBUG(llvm::dbgs() << "  - False from " << condBrOp << "\n");
-          mergeArgs(condBrOp.getFalseDestOperands(), condBrOp.getCondition(),
-                    true);
+          incoming.args = llvm::to_vector(condBrOp.getFalseDestOperands());
+          incoming.cond = condBrOp.getCondition();
+          incoming.invCond = true;
         }
       } else {
         auto brOp = cast<cf::BranchOp>(pred->getTerminator());
         LLVM_DEBUG(llvm::dbgs() << "  - From " << brOp << "\n");
-        mergeArgs(brOp.getDestOperands(), Value{}, false);
+        incoming.args = llvm::to_vector(brOp.getDestOperands());
       }
     }
-    for (auto [blockArg, mergedArg] :
-         llvm::zip(block->getArguments(), mergedArgs))
+
+    // Compute the decision that causes control to flow from `domBlock` into
+    // the current block along the given incoming edge.
+    auto getDecision = [&](Incoming &incoming) {
+      if (!incoming.decision) {
+        auto decision = getBranchDecisionsFromDominatorToTarget(
+            builder, domBlock, incoming.pred, decisionCache);
+        if (incoming.cond) {
+          auto cond = Condition(incoming.cond);
+          if (incoming.invCond)
+            cond = cond.inverted(builder);
+          decision = decision.andWith(cond, builder);
+        }
+        incoming.decision = decision;
+      }
+      return incoming.decision;
+    };
+
+    // Determine the blocks through which control can flow from `domBlock` into
+    // the current block, in topological order. Since `domBlock` dominates all
+    // predecessors, walking backwards from them always ends at `domBlock`.
+    SmallDenseMap<Block *, unsigned> incomingIndices;
+    for (auto [idx, incoming] : llvm::enumerate(incomings))
+      incomingIndices.insert({incoming.pred, idx});
+    SmallPtrSet<Block *, 16> betweenSet;
+    SmallVector<Block *> worklist;
+    for (auto &incoming : incomings)
+      worklist.push_back(incoming.pred);
+    while (!worklist.empty()) {
+      auto *betweenBlock = worklist.pop_back_val();
+      if (!betweenSet.insert(betweenBlock).second || betweenBlock == domBlock)
+        continue;
+      for (auto *pred : betweenBlock->getPredecessors())
+        if (domInfo.isReachableFromEntry(pred))
+          worklist.push_back(pred);
+    }
+    SmallVector<Block *> betweenBlocks;
+    for (auto *sortedBlock : sortedBlocks)
+      if (betweenSet.contains(sortedBlock))
+        betweenBlocks.push_back(sortedBlock);
+
+    // A term in the condition under which a value flows into a block argument:
+    // either control flowing from `domBlock` to a block, or control flowing
+    // into the current block along an incoming edge.
+    struct Term {
+      Block *block = nullptr;
+      Incoming *incoming = nullptr;
+    };
+    auto getTermDecision = [&](Term term) {
+      if (term.incoming)
+        return getDecision(*term.incoming);
+      return getBranchDecisionsFromDominatorToTarget(builder, domBlock,
+                                                     term.block, decisionCache);
+    };
+    // Estimate the complexity of a term's decision.
+    auto getTermWeight = [&](Term term) -> unsigned {
+      if (term.incoming)
+        return 1;
+      auto preds = term.block->getPredecessors();
+      return std::max<unsigned>(1, std::distance(preds.begin(), preds.end()));
+    };
+
+    // Merge the incoming values of each block argument into a multiplexer
+    // chain. The decisions of the incoming edges are mutually exclusive, and
+    // exactly one of them holds whenever control reaches the block. This
+    // allows us to pick any incoming value as the unconditional base of the
+    // chain, and to guard all other values by the disjunction of the decisions
+    // of the edges carrying them.
+    //
+    // To avoid muxes depending on branch decisions that do not affect the
+    // argument, we find the blocks from which all reachable incoming edges
+    // carry the same value. If control flows through such a uniform block,
+    // the argument is guaranteed to have that value if the current block is
+    // reached at all. Therefore it is sufficient to check for control flowing
+    // into the uniform block, ignoring any branches between it and the current
+    // block. Without this, an argument would structurally depend on the
+    // conditions of unrelated branches, which may create spurious
+    // combinational loops once the surrounding processes are lowered.
+    for (auto [argIdx, blockArg] : llvm::enumerate(block->getArguments())) {
+      if (incomings.empty())
+        break;
+
+      // Determine the blocks from which all reachable incoming edges carry the
+      // same value. Visit successors before their predecessors.
+      SmallDenseMap<Block *, Value> uniformValues;
+      for (auto *betweenBlock : llvm::reverse(betweenBlocks)) {
+        Value uniformValue;
+        bool isUniform = true;
+        auto addValue = [&](Value value) {
+          if (!value || (uniformValue && uniformValue != value))
+            isUniform = false;
+          uniformValue = value;
+        };
+        if (auto it = incomingIndices.find(betweenBlock);
+            it != incomingIndices.end())
+          addValue(incomings[it->second].args[argIdx]);
+        for (auto *succ : betweenBlock->getSuccessors())
+          if (succ != block && betweenSet.contains(succ))
+            addValue(uniformValues.lookup(succ));
+        if (isUniform)
+          uniformValues.insert({betweenBlock, uniformValue});
+      }
+
+      // Walk from `domBlock` towards the current block and collect the terms
+      // under which each value flows into the argument, stopping at uniform
+      // blocks.
+      SmallMapVector<Value, SmallVector<Term, 2>, 4> termsByValue;
+      SmallPtrSet<Block *, 16> activeBlocks;
+      activeBlocks.insert(domBlock);
+      for (auto *betweenBlock : betweenBlocks) {
+        if (!activeBlocks.contains(betweenBlock))
+          continue;
+        if (auto value = uniformValues.lookup(betweenBlock)) {
+          termsByValue[value].push_back({betweenBlock, nullptr});
+          continue;
+        }
+        if (auto it = incomingIndices.find(betweenBlock);
+            it != incomingIndices.end()) {
+          auto &incoming = incomings[it->second];
+          termsByValue[incoming.args[argIdx]].push_back({nullptr, &incoming});
+        }
+        for (auto *succ : betweenBlock->getSuccessors())
+          if (betweenSet.contains(succ))
+            activeBlocks.insert(succ);
+      }
+
+      // Pick the value with the most complex condition as the base of the mux
+      // chain. On ties, prefer the value carried by the earliest incoming
+      // edge, which is the one from the dominating predecessor if there is
+      // one.
+      SmallDenseMap<Value, unsigned> firstIncomingIndices;
+      for (auto [idx, incoming] : llvm::enumerate(incomings))
+        firstIncomingIndices.insert({incoming.args[argIdx], idx});
+      SmallVector<std::pair<unsigned, unsigned>> weights;
+      for (auto &[value, terms] : termsByValue) {
+        unsigned weight = 0;
+        for (auto term : terms)
+          weight += getTermWeight(term);
+        weights.push_back({weight, firstIncomingIndices.lookup(value)});
+      }
+      unsigned baseIdx = 0;
+      for (auto [idx, weight] : llvm::enumerate(weights))
+        if (weight.first > weights[baseIdx].first ||
+            (weight.first == weights[baseIdx].first &&
+             weight.second < weights[baseIdx].second))
+          baseIdx = idx;
+
+      Value mergedArg = termsByValue.begin()[baseIdx].first;
+      for (auto [idx, valueAndTerms] : llvm::enumerate(termsByValue)) {
+        if (idx == baseIdx)
+          continue;
+        auto &[arg, terms] = valueAndTerms;
+        auto decision = Condition(false);
+        for (auto term : terms)
+          decision = decision.orWith(getTermDecision(term), builder);
+        if (decision.isTrue())
+          mergedArg = arg;
+        else if (decision.isFalse())
+          continue;
+        else
+          mergedArg = builder.createOrFold<comb::MuxOp>(
+              arg.getLoc(), decision.materialize(builder, arg.getLoc()), arg,
+              mergedArg);
+      }
       blockArg.replaceAllUsesWith(mergedArg);
+    }
 
     // Move all ops except for the terminator into the entry block.
     if (block != entryBlock)
