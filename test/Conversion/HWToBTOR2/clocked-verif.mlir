@@ -30,8 +30,18 @@ module {
     verif.clocked_assume %cond, posedge %0 : i1
 
     // CHECK: [[NOT:[0-9]+]] not [[I1]] [[REG]]
-    // CHECK: [[BAD:[0-9]+]] bad [[NOT]]
+    // CHECK: [[BAD:[0-9]+]] bad [[NOT]]{{$}}
     verif.clocked_assert %reg, posedge %0 : i1
+
+    // Labels are emitted as the btor2 symbol of the bad/constraint line.
+    // CHECK: constraint [[EQ]] Step0_MyAssume{{$}}
+    verif.clocked_assume %cond, posedge %0 label "Step0_MyAssume" : i1
+    // CHECK: [[NOT2:[0-9]+]] not [[I1]] [[REG]]
+    // CHECK: bad [[NOT2]] Step1_MyAssert{{$}}
+    verif.clocked_assert %reg, posedge %0 label "Step1_MyAssert" : i1
+    // CHECK: [[NOT3:[0-9]+]] not [[I1]] [[REG]]
+    // CHECK: bad [[NOT3]] has_spaces_in_label{{$}}
+    verif.assert %reg label "has spaces in label" : i1
 
     // CHECK: next [[I1]] [[REG]] [[EQ]]
   }
