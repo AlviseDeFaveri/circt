@@ -272,13 +272,34 @@ private:
     return constlid;
   }
 
+  // Generates (or reuses) a constant declaration for a value that is not
+  // associated with an operation, e.g. a register preset attribute, and returns
+  // its lid
+  size_t genConstValue(const APInt &value) {
+    if (auto it = constToLIDMap.find(value); it != constToLIDMap.end())
+      return it->second;
+
+    size_t sid = sortToLIDMap.at(value.getBitWidth());
+    size_t constlid = lid++;
+    constToLIDMap[value] = constlid;
+    os << constlid << " "
+       << "constd"
+       << " " << sid << " " << llvm::toString(value, 10, /*Signed=*/false)
+       << "\n";
+    return constlid;
+  }
+
   // Generates an init statement, which allows for the use of initial values
   // operands in compreg registers
   void genInit(Operation *reg, Value initVal, int64_t width) {
+    genInit(reg, getOpLID(initVal), width);
+  }
+
+  // Generates an init statement given the lid of the initial value
+  void genInit(Operation *reg, size_t initValLID, int64_t width) {
     // Retrieve the various identifiers we require for this
     size_t regLID = getOpLID(reg);
     size_t sid = sortToLIDMap.at(width);
-    size_t initValLID = getOpLID(initVal);
 
     // Build and emit the string (the lid here doesn't need to be associated
     // to an op as it won't be used)
@@ -1102,8 +1123,31 @@ public:
     }
     int64_t w = requireSort(type);
 
+    // Determine the initial value of the register, if any. As for compregs,
+    // assuming an initial reset takes priority over the preset value. Without
+    // either, the register starts with an arbitrary value (no init statement).
+    std::optional<APInt> initValue;
+    if (assumeInitReset && reg.getResetValue()) {
+      auto resetConst = reg.getResetValue().getDefiningOp<hw::ConstantOp>();
+      if (!resetConst) {
+        reg->emitError("Reset value must be emitted directly by a hw.constant "
+                       "op when --assume-init-reset is in use.");
+        return signalPassFailure();
+      }
+      initValue = resetConst.getValue();
+    } else if (auto preset = reg.getPresetAttr()) {
+      initValue = preset.getValue().zextOrTrunc(w);
+    }
+
+    // The initial value constant must be declared before the state, and the
+    // init statement after it (BTOR2 parsers are picky about this order)
+    size_t initLID = initValue ? genConstValue(*initValue) : noLID;
+
     // Generate state instruction (represents the register declaration)
     genState(reg, w, regName);
+
+    if (initValue)
+      genInit(reg, initLID, w);
 
     // Record the operation for future `next` instruction generation
     // This is required to model transitions between states (i.e. how a
